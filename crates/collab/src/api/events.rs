@@ -1420,8 +1420,6 @@ fn for_snowflake(
                     "enable screen share" => "Screen Share Enabled".to_string(),
                     "disable screen share" => "Screen Share Disabled".to_string(),
                     "decline incoming" => "Incoming Call Declined".to_string(),
-                    "enable camera" => "Camera Enabled".to_string(),
-                    "disable camera" => "Camera Disabled".to_string(),
                     _ => format!("Unknown Call Event: {}", e.operation),
                 };
 
@@ -1578,8 +1576,8 @@ fn for_snowflake(
     })
 }
 
-#[derive(Serialize, Deserialize)]
-struct SnowflakeRow {
+#[derive(Serialize, Deserialize, Debug)]
+pub struct SnowflakeRow {
     pub time: chrono::DateTime<chrono::Utc>,
     pub user_id: Option<String>,
     pub device_id: Option<String>,
@@ -1589,47 +1587,41 @@ struct SnowflakeRow {
     pub insert_id: Option<String>,
 }
 
-#[derive(Serialize, Deserialize)]
-struct SnowflakeData {
-    /// Identifier unique to each Zed installation (differs for stable, preview, dev)
-    pub installation_id: Option<String>,
-    /// Identifier unique to each logged in Zed user (randomly generated on first sign in)
-    /// Identifier unique to each Zed session (differs for each time you open Zed)
-    pub session_id: Option<String>,
-    pub metrics_id: Option<String>,
-    /// True for Zed staff, otherwise false
-    pub is_staff: Option<bool>,
-    /// Zed version number
-    pub app_version: String,
-    pub os_name: String,
-    pub os_version: Option<String>,
-    pub architecture: String,
-    /// Zed release channel (stable, preview, dev)
-    pub release_channel: Option<String>,
-    pub signed_in: bool,
+impl SnowflakeRow {
+    pub fn new(
+        event_type: impl Into<String>,
+        metrics_id: Option<Uuid>,
+        is_staff: bool,
+        system_id: Option<String>,
+        event_properties: serde_json::Value,
+    ) -> Self {
+        Self {
+            time: chrono::Utc::now(),
+            event_type: event_type.into(),
+            device_id: system_id,
+            user_id: metrics_id.map(|id| id.to_string()),
+            insert_id: Some(uuid::Uuid::new_v4().to_string()),
+            event_properties,
+            user_properties: Some(json!({"is_staff": is_staff})),
+        }
+    }
 
-    #[serde(flatten)]
-    pub editor_event: Option<EditorEvent>,
-    #[serde(flatten)]
-    pub inline_completion_event: Option<InlineCompletionEvent>,
-    #[serde(flatten)]
-    pub call_event: Option<CallEvent>,
-    #[serde(flatten)]
-    pub assistant_event: Option<AssistantEvent>,
-    #[serde(flatten)]
-    pub cpu_event: Option<CpuEvent>,
-    #[serde(flatten)]
-    pub memory_event: Option<MemoryEvent>,
-    #[serde(flatten)]
-    pub app_event: Option<AppEvent>,
-    #[serde(flatten)]
-    pub setting_event: Option<SettingEvent>,
-    #[serde(flatten)]
-    pub extension_event: Option<ExtensionEvent>,
-    #[serde(flatten)]
-    pub edit_event: Option<EditEvent>,
-    #[serde(flatten)]
-    pub repl_event: Option<ReplEvent>,
-    #[serde(flatten)]
-    pub action_event: Option<ActionEvent>,
+    pub async fn write(
+        self,
+        client: &Option<aws_sdk_kinesis::Client>,
+        stream: &Option<String>,
+    ) -> anyhow::Result<()> {
+        let Some((client, stream)) = client.as_ref().zip(stream.as_ref()) else {
+            return Ok(());
+        };
+        let row = serde_json::to_vec(&self)?;
+        client
+            .put_record()
+            .stream_name(stream)
+            .partition_key(&self.user_id.unwrap_or_default())
+            .data(row.into())
+            .send()
+            .await?;
+        Ok(())
+    }
 }
