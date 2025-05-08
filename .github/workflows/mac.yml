@@ -5,7 +5,7 @@ on:
 jobs:
   bundle-mac:
     name: Create a macOS bundle
-    runs-on: macos-latast
+    runs-on: macos-latest
     steps:
       - name: Install Node
         uses: actions/setup-node@cdca7365b2dadb8aad0a33bc7601856ffabcc48e # v4
