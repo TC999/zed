@@ -1,0 +1,21 @@
+name: mac 编译
+on:
+    workflow_dispatch:
+
+jobs:
+  bundle-mac:
+    name: Create a macOS bundle
+    runs-on: macos-latast
+    steps:
+      - name: Install Node
+        uses: actions/setup-node@cdca7365b2dadb8aad0a33bc7601856ffabcc48e # v4
+        with:
+          node-version: "18"  
+      - name: Checkout repo
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4
+        with:
+          clean: false  
+      - name: Create macOS app bundle
+        run: script/bundle-mac  
+      - name: Upload Zed Nightly
+        run: script/upload-nightly macos
