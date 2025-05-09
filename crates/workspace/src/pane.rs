@@ -1578,7 +1578,6 @@ impl Pane {
                         window,
                         cx,
                     );
-                    pane.remove_item(item_to_close.item_id(), false, true, window, cx);
                 })
                 .ok();
             }
@@ -3327,6 +3326,13 @@ impl Render for Pane {
                     }
                 }),
             )
+            .on_action(cx.listener(|_, _: &menu::Cancel, window, cx| {
+                if cx.stop_active_drag(window) {
+                    return;
+                } else {
+                    cx.propagate();
+                }
+            }))
             .when(self.active_item().is_some() && display_tab_bar, |pane| {
                 pane.child((self.render_tab_bar.clone())(self, window, cx))
             })
