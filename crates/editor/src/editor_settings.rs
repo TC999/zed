@@ -4,6 +4,7 @@ use project::project_settings::DiagnosticSeverity;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use settings::{Settings, SettingsSources, VsCodeSettings};
+use util::serde::default_true;
 
 #[derive(Deserialize, Clone)]
 pub struct EditorSettings {
@@ -131,6 +132,13 @@ pub struct Minimap {
 impl Minimap {
     pub fn minimap_enabled(&self) -> bool {
         self.show != ShowMinimap::Never
+    }
+
+    pub fn with_show_override(self) -> Self {
+        Self {
+            show: ShowMinimap::Always,
+            ..self
+        }
     }
 }
 
@@ -269,6 +277,9 @@ pub enum ScrollBeyondLastLine {
 /// Default options for buffer and project search items.
 #[derive(Copy, Clone, Default, Debug, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
 pub struct SearchSettings {
+    /// Whether to show the project search button in the status bar.
+    #[serde(default = "default_true")]
+    pub button: bool,
     #[serde(default)]
     pub whole_word: bool,
     #[serde(default)]

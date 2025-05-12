@@ -137,7 +137,7 @@ pub use proposed_changes_editor::{
     ProposedChangeLocation, ProposedChangesEditor, ProposedChangesEditorToolbar,
 };
 use smallvec::smallvec;
-use std::{cell::OnceCell, iter::Peekable};
+use std::{cell::OnceCell, iter::Peekable, ops::Not};
 use task::{ResolvedTask, RunnableTag, TaskTemplate, TaskVariables};
 
 pub use lsp::CompletionContext;
@@ -184,7 +184,7 @@ use std::{
     cmp::{self, Ordering, Reverse},
     mem,
     num::NonZeroU32,
-    ops::{ControlFlow, Deref, DerefMut, Not as _, Range, RangeInclusive},
+    ops::{ControlFlow, Deref, DerefMut, Range, RangeInclusive},
     path::{Path, PathBuf},
     rc::Rc,
     time::{Duration, Instant},
@@ -711,6 +711,43 @@ impl ScrollbarMarkerState {
     }
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum MinimapVisibility {
+    Disabled,
+    Enabled(bool),
+}
+
+impl MinimapVisibility {
+    fn for_mode(mode: &EditorMode, cx: &App) -> Self {
+        if mode.is_full() {
+            Self::Enabled(EditorSettings::get_global(cx).minimap.minimap_enabled())
+        } else {
+            Self::Disabled
+        }
+    }
+
+    fn disabled(&self) -> bool {
+        match *self {
+            Self::Disabled => true,
+            _ => false,
+        }
+    }
+
+    fn visible(&self) -> bool {
+        match *self {
+            Self::Enabled(visible) => visible,
+            _ => false,
+        }
+    }
+
+    fn toggle_visibility(&self) -> Self {
+        match *self {
+            Self::Enabled(visible) => Self::Enabled(!visible),
+            Self::Disabled => Self::Disabled,
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 struct RunnableTasks {
     templates: Vec<(TaskSourceKind, TaskTemplate)>,
@@ -883,7 +920,7 @@ pub struct Editor {
     show_breadcrumbs: bool,
     show_gutter: bool,
     show_scrollbars: bool,
-    show_minimap: bool,
+    minimap_visibility: MinimapVisibility,
     disable_expand_excerpt_buttons: bool,
     show_line_numbers: Option<bool>,
     use_relative_line_numbers: Option<bool>,
@@ -1721,7 +1758,7 @@ impl Editor {
             blink_manager: blink_manager.clone(),
             show_local_selections: true,
             show_scrollbars: full_mode,
-            show_minimap: full_mode,
+            minimap_visibility: MinimapVisibility::for_mode(&mode, cx),
             show_breadcrumbs: EditorSettings::get_global(cx).toolbar.breadcrumbs,
             show_gutter: mode.is_full(),
             show_line_numbers: None,
@@ -5014,27 +5051,19 @@ impl Editor {
         let snippet;
         let new_text;
         if completion.is_snippet() {
-            // lsp returns function definition with placeholders in "new_text"
-            // when configured from language server, even when renaming a function
-            //
-            // in such cases, we use the label instead
-            // https://github.com/zed-industries/zed/issues/29982
-            let snippet_source = completion
-                .label()
-                .filter(|label| {
-                    completion.kind() == Some(CompletionItemKind::FUNCTION)
-                        && label != &completion.new_text
-                })
-                .and_then(|label| {
-                    let cursor_offset = newest_anchor.head().to_offset(&snapshot);
-                    let next_char_is_not_whitespace = snapshot
-                        .chars_at(cursor_offset)
-                        .next()
-                        .map_or(true, |ch| !ch.is_whitespace());
-                    next_char_is_not_whitespace.then_some(label)
-                })
-                .unwrap_or(completion.new_text.clone());
-
+            let mut snippet_source = completion.new_text.clone();
+            if let Some(scope) = snapshot.language_scope_at(newest_anchor.head()) {
+                if scope.prefers_label_for_snippet_in_completion() {
+                    if let Some(label) = completion.label() {
+                        if matches!(
+                            completion.kind(),
+                            Some(CompletionItemKind::FUNCTION) | Some(CompletionItemKind::METHOD)
+                        ) {
+                            snippet_source = label;
+                        }
+                    }
+                }
+            }
             snippet = Some(Snippet::parse(&snippet_source).log_err()?);
             new_text = snippet.as_ref().unwrap().text.clone();
         } else {
@@ -6138,8 +6167,8 @@ impl Editor {
         }
     }
 
-    pub fn supports_minimap(&self) -> bool {
-        self.mode.is_full()
+    pub fn supports_minimap(&self, cx: &App) -> bool {
+        !self.minimap_visibility.disabled() && self.is_singleton(cx)
     }
 
     fn edit_predictions_enabled_in_buffer(
@@ -8750,15 +8779,13 @@ impl Editor {
                 continue;
             }
 
-            // If the selection is empty and the cursor is in the leading whitespace before the
-            // suggested indentation, then auto-indent the line.
             let cursor = selection.head();
             let current_indent = snapshot.indent_size_for_line(MultiBufferRow(cursor.row));
             if let Some(suggested_indent) =
                 suggested_indents.get(&MultiBufferRow(cursor.row)).copied()
             {
-                // If there exist any empty selection in the leading whitespace, then skip
-                // indent for selections at the boundary.
+                // Don't do anything if already at suggested indent
+                // and there is any other cursor which is not
                 if has_some_cursor_in_whitespace
                     && cursor.column == current_indent.len
                     && current_indent.len == suggested_indent.len
@@ -8766,6 +8793,8 @@ impl Editor {
                     continue;
                 }
 
+                // Adjust line and move cursor to suggested indent
+                // if cursor is not at suggested indent
                 if cursor.column < suggested_indent.len
                     && cursor.column <= current_indent.len
                     && current_indent.len <= suggested_indent.len
@@ -8780,6 +8809,14 @@ impl Editor {
                         ));
                         row_delta = suggested_indent.len - current_indent.len;
                     }
+                    continue;
+                }
+
+                // If current indent is more than suggested indent
+                // only move cursor to current indent and skip indent
+                if cursor.column < current_indent.len && current_indent.len > suggested_indent.len {
+                    selection.start = Point::new(cursor.row, current_indent.len);
+                    selection.end = selection.start;
                     continue;
                 }
             }
@@ -15169,8 +15206,8 @@ impl Editor {
         window: &mut Window,
         cx: &mut Context<Editor>,
     ) {
-        if self.supports_minimap() {
-            self.set_show_minimap(!self.show_minimap, window, cx);
+        if self.supports_minimap(cx) {
+            self.set_minimap_visibility(self.minimap_visibility.toggle_visibility(), window, cx);
         }
     }
 
@@ -16441,7 +16478,9 @@ impl Editor {
     }
 
     pub fn minimap(&self) -> Option<&Entity<Self>> {
-        self.minimap.as_ref().filter(|_| self.show_minimap)
+        self.minimap
+            .as_ref()
+            .filter(|_| self.minimap_visibility.visible())
     }
 
     pub fn wrap_guides(&self, cx: &App) -> SmallVec<[(usize, bool); 2]> {
@@ -16638,27 +16677,26 @@ impl Editor {
         cx.notify();
     }
 
-    pub fn set_show_minimap(
+    pub fn set_minimap_visibility(
         &mut self,
-        show_minimap: bool,
+        minimap_visibility: MinimapVisibility,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if self.show_minimap != show_minimap {
-            self.show_minimap = show_minimap;
-            if show_minimap {
+        if self.minimap_visibility != minimap_visibility {
+            if minimap_visibility.visible() && self.minimap.is_none() {
                 let minimap_settings = EditorSettings::get_global(cx).minimap;
-                self.minimap = self.create_minimap(minimap_settings, window, cx);
-            } else {
-                self.minimap = None;
+                self.minimap =
+                    self.create_minimap(minimap_settings.with_show_override(), window, cx);
             }
+            self.minimap_visibility = minimap_visibility;
             cx.notify();
         }
     }
 
     pub fn disable_scrollbars_and_minimap(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.set_show_scrollbars(false, cx);
-        self.set_show_minimap(false, window, cx);
+        self.set_minimap_visibility(MinimapVisibility::Disabled, window, cx);
     }
 
     pub fn set_show_line_numbers(&mut self, show_line_numbers: bool, cx: &mut Context<Self>) {
@@ -18160,8 +18198,12 @@ impl Editor {
             }
 
             let minimap_settings = EditorSettings::get_global(cx).minimap;
-            if self.show_minimap != minimap_settings.minimap_enabled() {
-                self.set_show_minimap(!self.show_minimap, window, cx);
+            if self.minimap_visibility.visible() != minimap_settings.minimap_enabled() {
+                self.set_minimap_visibility(
+                    self.minimap_visibility.toggle_visibility(),
+                    window,
+                    cx,
+                );
             } else if let Some(minimap_entity) = self.minimap.as_ref() {
                 minimap_entity.update(cx, |minimap_editor, cx| {
                     minimap_editor.update_minimap_configuration(minimap_settings, cx)
