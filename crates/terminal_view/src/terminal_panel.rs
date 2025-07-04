@@ -46,7 +46,13 @@ use zed_actions::assistant::InlineAssist;
 
 const TERMINAL_PANEL_KEY: &str = "TerminalPanel";
 
-actions!(terminal_panel, [ToggleFocus]);
+actions!(
+    terminal_panel,
+    [
+        /// Toggles focus on the terminal panel.
+        ToggleFocus
+    ]
+);
 
 pub fn init(cx: &mut App) {
     cx.observe_new(
@@ -325,7 +331,6 @@ impl TerminalPanel {
                     .ok();
             }
         }
-
         Ok(terminal_panel)
     }
 
@@ -393,6 +398,9 @@ impl TerminalPanel {
             pane::Event::Focus => {
                 self.active_pane = pane.clone();
             }
+            pane::Event::ItemPinned | pane::Event::ItemUnpinned => {
+                self.serialize(cx);
+            }
 
             _ => {}
         }
@@ -437,7 +445,6 @@ impl TerminalPanel {
                 weak_workspace.clone(),
                 database_id,
                 project.downgrade(),
-                false,
                 window,
                 cx,
             )
@@ -675,7 +682,6 @@ impl TerminalPanel {
                         workspace.weak_handle(),
                         workspace.database_id(),
                         workspace.project().downgrade(),
-                        false,
                         window,
                         cx,
                     )
@@ -716,7 +722,6 @@ impl TerminalPanel {
                         workspace.weak_handle(),
                         workspace.database_id(),
                         workspace.project().downgrade(),
-                        false,
                         window,
                         cx,
                     )
@@ -1063,6 +1068,7 @@ pub fn new_terminal_pane(
                                             &new_pane,
                                             item_id_to_move,
                                             new_pane.read(cx).active_item_index(),
+                                            true,
                                             window,
                                             cx,
                                         );
