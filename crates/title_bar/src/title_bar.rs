@@ -279,13 +279,15 @@ impl TitleBar {
 
         let banner = cx.new(|cx| {
             OnboardingBanner::new(
-                "ACP Onboarding",
-                IconName::Sparkle,
-                "Bring Your Own Agent",
+                "ACP Claude Code Onboarding",
+                IconName::AiClaude,
+                "Claude Code",
                 Some("Introducing:".into()),
-                zed_actions::agent::OpenAcpOnboardingModal.boxed_clone(),
+                zed_actions::agent::OpenClaudeCodeOnboardingModal.boxed_clone(),
                 cx,
             )
+            // When updating this to a non-AI feature release, remove this line.
+            .visible_when(|cx| !project::DisableAiSettings::get_global(cx).disable_ai)
         });
 
         let platform_titlebar = cx.new(|cx| PlatformTitleBar::new(id, cx));
@@ -658,8 +660,12 @@ impl TitleBar {
 
                         let (plan_name, label_color, bg_color) = match plan {
                             None | Some(Plan::ZedFree) => ("Free", Color::Default, free_chip_bg),
-                            Some(Plan::ZedProTrial) => ("Pro Trial", Color::Accent, pro_chip_bg),
-                            Some(Plan::ZedPro) => ("Pro", Color::Accent, pro_chip_bg),
+                            Some(Plan::ZedProTrial | Plan::ZedProTrialV2) => {
+                                ("Pro Trial", Color::Accent, pro_chip_bg)
+                            }
+                            Some(Plan::ZedPro | Plan::ZedProV2) => {
+                                ("Pro", Color::Accent, pro_chip_bg)
+                            }
                         };
 
                         menu.custom_entry(
@@ -687,7 +693,7 @@ impl TitleBar {
                             "Settings Profiles",
                             zed_actions::settings_profile_selector::Toggle.boxed_clone(),
                         )
-                        .action("Key Bindings", Box::new(keymap_editor::OpenKeymapEditor))
+                        .action("Keymap Editor", Box::new(keymap_editor::OpenKeymapEditor))
                         .action(
                             "Themes…",
                             zed_actions::theme_selector::Toggle::default().boxed_clone(),

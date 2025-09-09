@@ -1,4 +1,3 @@
-use crate::AgentServerCommand;
 use acp_thread::AgentConnection;
 use acp_tools::AcpConnectionRegistry;
 use action_log::ActionLog;
@@ -8,8 +7,10 @@ use collections::HashMap;
 use futures::AsyncBufReadExt as _;
 use futures::io::BufReader;
 use project::Project;
+use project::agent_server_store::AgentServerCommand;
 use serde::Deserialize;
 
+use std::path::PathBuf;
 use std::{any::Any, cell::RefCell};
 use std::{path::Path, rc::Rc};
 use thiserror::Error;
@@ -28,7 +29,8 @@ pub struct AcpConnection {
     connection: Rc<acp::ClientSideConnection>,
     sessions: Rc<RefCell<HashMap<acp::SessionId, AcpSession>>>,
     auth_methods: Vec<acp::AuthMethod>,
-    prompt_capabilities: acp::PromptCapabilities,
+    agent_capabilities: acp::AgentCapabilities,
+    root_dir: PathBuf,
     _io_task: Task<Result<()>>,
     _wait_task: Task<Result<()>>,
     _stderr_task: Task<Result<()>>,
@@ -43,9 +45,10 @@ pub async fn connect(
     server_name: SharedString,
     command: AgentServerCommand,
     root_dir: &Path,
+    is_remote: bool,
     cx: &mut AsyncApp,
 ) -> Result<Rc<dyn AgentConnection>> {
-    let conn = AcpConnection::stdio(server_name, command.clone(), root_dir, cx).await?;
+    let conn = AcpConnection::stdio(server_name, command.clone(), root_dir, is_remote, cx).await?;
     Ok(Rc::new(conn) as _)
 }
 
@@ -56,17 +59,21 @@ impl AcpConnection {
         server_name: SharedString,
         command: AgentServerCommand,
         root_dir: &Path,
+        is_remote: bool,
         cx: &mut AsyncApp,
     ) -> Result<Self> {
-        let mut child = util::command::new_smol_command(command.path)
+        let mut child = util::command::new_smol_command(command.path);
+        child
             .args(command.args.iter().map(|arg| arg.as_str()))
             .envs(command.env.iter().flatten())
-            .current_dir(root_dir)
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
-            .kill_on_drop(true)
-            .spawn()?;
+            .kill_on_drop(true);
+        if !is_remote {
+            child.current_dir(root_dir);
+        }
+        let mut child = child.spawn()?;
 
         let stdout = child.stdout.take().context("Failed to take stdout")?;
         let stdin = child.stdin.take().context("Failed to take stdin")?;
@@ -134,6 +141,7 @@ impl AcpConnection {
                         read_text_file: true,
                         write_text_file: true,
                     },
+                    terminal: true,
                 },
             })
             .await?;
@@ -144,10 +152,11 @@ impl AcpConnection {
 
         Ok(Self {
             auth_methods: response.auth_methods,
+            root_dir: root_dir.to_owned(),
             connection,
             server_name,
             sessions,
-            prompt_capabilities: response.agent_capabilities.prompt_capabilities,
+            agent_capabilities: response.agent_capabilities,
             _io_task: io_task,
             _wait_task: wait_task,
             _stderr_task: stderr_task,
@@ -155,7 +164,11 @@ impl AcpConnection {
     }
 
     pub fn prompt_capabilities(&self) -> &acp::PromptCapabilities {
-        &self.prompt_capabilities
+        &self.agent_capabilities.prompt_capabilities
+    }
+
+    pub fn root_dir(&self) -> &Path {
+        &self.root_dir
     }
 }
 
@@ -170,29 +183,36 @@ impl AgentConnection for AcpConnection {
         let sessions = self.sessions.clone();
         let cwd = cwd.to_path_buf();
         let context_server_store = project.read(cx).context_server_store().read(cx);
-        let mcp_servers = context_server_store
-            .configured_server_ids()
-            .iter()
-            .filter_map(|id| {
-                let configuration = context_server_store.configuration_for_server(id)?;
-                let command = configuration.command();
-                Some(acp::McpServer {
-                    name: id.0.to_string(),
-                    command: command.path.clone(),
-                    args: command.args.clone(),
-                    env: if let Some(env) = command.env.as_ref() {
-                        env.iter()
-                            .map(|(name, value)| acp::EnvVariable {
-                                name: name.clone(),
-                                value: value.clone(),
-                            })
-                            .collect()
-                    } else {
-                        vec![]
-                    },
+        let mcp_servers = if project.read(cx).is_local() {
+            context_server_store
+                .configured_server_ids()
+                .iter()
+                .filter_map(|id| {
+                    let configuration = context_server_store.configuration_for_server(id)?;
+                    let command = configuration.command();
+                    Some(acp::McpServer {
+                        name: id.0.to_string(),
+                        command: command.path.clone(),
+                        args: command.args.clone(),
+                        env: if let Some(env) = command.env.as_ref() {
+                            env.iter()
+                                .map(|(name, value)| acp::EnvVariable {
+                                    name: name.clone(),
+                                    value: value.clone(),
+                                })
+                                .collect()
+                        } else {
+                            vec![]
+                        },
+                    })
                 })
-            })
-            .collect();
+                .collect()
+        } else {
+            // In SSH projects, the external agent is running on the remote
+            // machine, and currently we only run MCP servers on the local
+            // machine. So don't pass any MCP servers to the agent in that case.
+            Vec::new()
+        };
 
         cx.spawn(async move |cx| {
             let response = conn
@@ -222,7 +242,7 @@ impl AgentConnection for AcpConnection {
                     action_log,
                     session_id.clone(),
                     // ACP doesn't currently support per-session prompt capabilities or changing capabilities dynamically.
-                    watch::Receiver::constant(self.prompt_capabilities),
+                    watch::Receiver::constant(self.agent_capabilities.prompt_capabilities),
                     cx,
                 )
             })?;
@@ -344,11 +364,7 @@ impl acp::Client for ClientDelegate {
         let cx = &mut self.cx.clone();
 
         let task = self
-            .sessions
-            .borrow()
-            .get(&arguments.session_id)
-            .context("Failed to get session")?
-            .thread
+            .session_thread(&arguments.session_id)?
             .update(cx, |thread, cx| {
                 thread.request_tool_call_authorization(arguments.tool_call, arguments.options, cx)
             })??;
@@ -364,11 +380,7 @@ impl acp::Client for ClientDelegate {
     ) -> Result<(), acp::Error> {
         let cx = &mut self.cx.clone();
         let task = self
-            .sessions
-            .borrow()
-            .get(&arguments.session_id)
-            .context("Failed to get session")?
-            .thread
+            .session_thread(&arguments.session_id)?
             .update(cx, |thread, cx| {
                 thread.write_text_file(arguments.path, arguments.content, cx)
             })?;
@@ -382,16 +394,12 @@ impl acp::Client for ClientDelegate {
         &self,
         arguments: acp::ReadTextFileRequest,
     ) -> Result<acp::ReadTextFileResponse, acp::Error> {
-        let cx = &mut self.cx.clone();
-        let task = self
-            .sessions
-            .borrow()
-            .get(&arguments.session_id)
-            .context("Failed to get session")?
-            .thread
-            .update(cx, |thread, cx| {
+        let task = self.session_thread(&arguments.session_id)?.update(
+            &mut self.cx.clone(),
+            |thread, cx| {
                 thread.read_text_file(arguments.path, arguments.line, arguments.limit, false, cx)
-            })?;
+            },
+        )?;
 
         let content = task.await?;
 
@@ -402,16 +410,92 @@ impl acp::Client for ClientDelegate {
         &self,
         notification: acp::SessionNotification,
     ) -> Result<(), acp::Error> {
-        let cx = &mut self.cx.clone();
-        let sessions = self.sessions.borrow();
-        let session = sessions
-            .get(&notification.session_id)
-            .context("Failed to get session")?;
-
-        session.thread.update(cx, |thread, cx| {
-            thread.handle_session_update(notification.update, cx)
-        })??;
+        self.session_thread(&notification.session_id)?
+            .update(&mut self.cx.clone(), |thread, cx| {
+                thread.handle_session_update(notification.update, cx)
+            })??;
 
         Ok(())
+    }
+
+    async fn create_terminal(
+        &self,
+        args: acp::CreateTerminalRequest,
+    ) -> Result<acp::CreateTerminalResponse, acp::Error> {
+        let terminal = self
+            .session_thread(&args.session_id)?
+            .update(&mut self.cx.clone(), |thread, cx| {
+                thread.create_terminal(
+                    args.command,
+                    args.args,
+                    args.env,
+                    args.cwd,
+                    args.output_byte_limit,
+                    cx,
+                )
+            })?
+            .await?;
+        Ok(
+            terminal.read_with(&self.cx, |terminal, _| acp::CreateTerminalResponse {
+                terminal_id: terminal.id().clone(),
+            })?,
+        )
+    }
+
+    async fn kill_terminal(&self, args: acp::KillTerminalRequest) -> Result<(), acp::Error> {
+        self.session_thread(&args.session_id)?
+            .update(&mut self.cx.clone(), |thread, cx| {
+                thread.kill_terminal(args.terminal_id, cx)
+            })??;
+
+        Ok(())
+    }
+
+    async fn release_terminal(&self, args: acp::ReleaseTerminalRequest) -> Result<(), acp::Error> {
+        self.session_thread(&args.session_id)?
+            .update(&mut self.cx.clone(), |thread, cx| {
+                thread.release_terminal(args.terminal_id, cx)
+            })??;
+
+        Ok(())
+    }
+
+    async fn terminal_output(
+        &self,
+        args: acp::TerminalOutputRequest,
+    ) -> Result<acp::TerminalOutputResponse, acp::Error> {
+        self.session_thread(&args.session_id)?
+            .read_with(&mut self.cx.clone(), |thread, cx| {
+                let out = thread
+                    .terminal(args.terminal_id)?
+                    .read(cx)
+                    .current_output(cx);
+
+                Ok(out)
+            })?
+    }
+
+    async fn wait_for_terminal_exit(
+        &self,
+        args: acp::WaitForTerminalExitRequest,
+    ) -> Result<acp::WaitForTerminalExitResponse, acp::Error> {
+        let exit_status = self
+            .session_thread(&args.session_id)?
+            .update(&mut self.cx.clone(), |thread, cx| {
+                anyhow::Ok(thread.terminal(args.terminal_id)?.read(cx).wait_for_exit())
+            })??
+            .await;
+
+        Ok(acp::WaitForTerminalExitResponse { exit_status })
+    }
+}
+
+impl ClientDelegate {
+    fn session_thread(&self, session_id: &acp::SessionId) -> Result<WeakEntity<AcpThread>> {
+        let sessions = self.sessions.borrow();
+        sessions
+            .get(session_id)
+            .context("Failed to get session")
+            .map(|session| session.thread.clone())
     }
 }
