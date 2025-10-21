@@ -17,6 +17,6 @@ jobs:
           cargo deb
 
       - name: upload deb
-        uses: actions/upload-artifact@v3
+        uses: actions/upload-artifact@v4
         with:
           name: target/release/*.deb
