@@ -3,6 +3,9 @@ name: Debian
 on:
   workflow_dispatch:
 
+env:
+  CARGO_TERM_COLOR: always
+
 jobs:
   Debian:
     runs-on: ubuntu-latest
