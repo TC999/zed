@@ -1,0 +1,22 @@
+name: Debian
+
+on:
+  workflow_dispatch:
+
+jobs:
+  Debian:
+    runs-on: ubuntu-latest
+    steps:
+      - name: checkout
+        uses: actions/checkout@v4
+
+      - run: cargo install cargo-deb
+
+      - run: |
+          sh ./script/generate-licenses
+          cargo deb
+
+      - name: upload deb
+        uses: actions/upload-artifact@v3
+        with:
+          name: target/release/*.deb
