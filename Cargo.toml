@@ -917,5 +917,5 @@ assets = [
     ["crates/zed/resources/app-icon.png", "/usr/share/icons/hicolor/512x512/apps/zed.png", "0644"],
     ["crates/zed/resources/app-icon@2x.png", "/usr/share/icons/hicolor/1024x1024/apps/zed.png", "0644"],
     ["dist/share/applications/zed.desktop", "/usr/share/applications/zed.desktop", "0644"],
-    ["assets/licenses.md", "/usr/share/doc/zed/licenses.md", "0644"],
+    #["assets/licenses.md", "/usr/share/doc/zed/licenses.md", "0644"],
 ]

@@ -13,7 +13,7 @@ jobs:
       - run: cargo install cargo-deb
 
       - run: |
-          sh ./script/generate-licenses
+          #sh ./script/generate-licenses
           cargo deb
 
       - name: upload deb
