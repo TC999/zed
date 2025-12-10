@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use collections::HashMap;
 use editor::{
-    Bias, DisplayPoint, Editor, SelectionEffects,
+    Bias, DisplayPoint, Editor, MultiBufferOffset, SelectionEffects,
     display_map::{DisplaySnapshot, ToDisplayPoint},
     movement,
 };
@@ -179,7 +179,7 @@ pub fn register(editor: &mut Editor, cx: &mut Context<Vim>) {
         vim.update_editor(cx, |_, editor, cx| {
             editor.set_clip_at_line_ends(false, cx);
             editor.change_selections(Default::default(), window, cx, |s| {
-                let map = s.display_map();
+                let map = s.display_snapshot();
                 let ranges = ranges
                     .into_iter()
                     .map(|(start, end, reversed)| {
@@ -304,7 +304,7 @@ impl Vim {
     ) {
         let text_layout_details = editor.text_layout_details(window);
         editor.change_selections(Default::default(), window, cx, |s| {
-            let map = &s.display_map();
+            let map = &s.display_snapshot();
             let mut head = s.newest_anchor().head().to_display_point(map);
             let mut tail = s.oldest_anchor().tail().to_display_point(map);
 
@@ -366,6 +366,8 @@ impl Vim {
 
             let mut selections = Vec::new();
             let mut row = tail.row();
+            let going_up = tail.row() > head.row();
+            let direction = if going_up { -1 } else { 1 };
 
             loop {
                 let laid_out_line = map.layout_row(row, &text_layout_details);
@@ -396,13 +398,18 @@ impl Vim {
 
                     selections.push(selection);
                 }
-                if row == head.row() {
+
+                // When dealing with soft wrapped lines, it's possible that
+                // `row` ends up being set to a value other than `head.row()` as
+                // `head.row()` might be a `DisplayPoint` mapped to a soft
+                // wrapped line, hence the need for `<=` and `>=` instead of
+                // `==`.
+                if going_up && row <= head.row() || !going_up && row >= head.row() {
                     break;
                 }
 
-                // Move to the next or previous buffer row, ensuring that
-                // wrapped lines are handled correctly.
-                let direction = if tail.row() > head.row() { -1 } else { 1 };
+                // Find the next or previous buffer row where the `row` should
+                // be moved to, so that wrapped lines are skipped.
                 row = map
                     .start_of_relative_buffer_row(DisplayPoint::new(row, 0), direction)
                     .row();
@@ -771,7 +778,7 @@ impl Vim {
                     {
                         let range = row_range.start.to_offset(&display_map, Bias::Right)
                             ..row_range.end.to_offset(&display_map, Bias::Right);
-                        let text = text.repeat(range.len());
+                        let text = text.repeat(range.end - range.start);
                         edits.push((range, text));
                     }
                 }
@@ -837,8 +844,8 @@ impl Vim {
             return;
         };
         let vim_is_normal = self.mode == Mode::Normal;
-        let mut start_selection = 0usize;
-        let mut end_selection = 0usize;
+        let mut start_selection = MultiBufferOffset(0);
+        let mut end_selection = MultiBufferOffset(0);
 
         self.update_editor(cx, |_, editor, _| {
             editor.set_collapse_matches(false);
@@ -861,7 +868,7 @@ impl Vim {
         self.update_editor(cx, |_, editor, cx| {
             let latest = editor
                 .selections
-                .newest::<usize>(&editor.display_snapshot(cx));
+                .newest::<MultiBufferOffset>(&editor.display_snapshot(cx));
             start_selection = latest.start;
             end_selection = latest.end;
         });
@@ -884,7 +891,7 @@ impl Vim {
         self.update_editor(cx, |_, editor, cx| {
             let latest = editor
                 .selections
-                .newest::<usize>(&editor.display_snapshot(cx));
+                .newest::<MultiBufferOffset>(&editor.display_snapshot(cx));
             if vim_is_normal {
                 start_selection = latest.start;
                 end_selection = latest.end;

@@ -24,7 +24,7 @@ use rpc::{
 
 use std::{io, sync::Arc, time::Instant};
 use text::{BufferId, ReplicaId};
-use util::{ResultExt as _, TryFutureExt, debug_panic, maybe, rel_path::RelPath};
+use util::{ResultExt as _, TryFutureExt, debug_panic, maybe, paths::PathStyle, rel_path::RelPath};
 use worktree::{File, PathChange, ProjectEntryId, Worktree, WorktreeId};
 
 /// A set of open buffers.
@@ -617,26 +617,36 @@ impl LocalBufferStore {
         worktree: Entity<Worktree>,
         cx: &mut Context<BufferStore>,
     ) -> Task<Result<Entity<Buffer>>> {
-        let load_buffer = worktree.update(cx, |worktree, cx| {
-            let load_file = worktree.load_file(path.as_ref(), cx);
-            let reservation = cx.reserve_entity();
-            let buffer_id = BufferId::from(reservation.entity_id().as_non_zero_u64());
-            cx.spawn(async move |_, cx| {
-                let loaded = load_file.await?;
-                let text_buffer = cx
-                    .background_spawn(async move {
-                        text::Buffer::new(ReplicaId::LOCAL, buffer_id, loaded.text)
-                    })
-                    .await;
-                cx.insert_entity(reservation, |_| {
-                    Buffer::build(text_buffer, Some(loaded.file), Capability::ReadWrite)
-                })
-            })
-        });
-
+        let load_file = worktree.update(cx, |worktree, cx| worktree.load_file(path.as_ref(), cx));
         cx.spawn(async move |this, cx| {
-            let buffer = match load_buffer.await {
-                Ok(buffer) => Ok(buffer),
+            let path = path.clone();
+            let single_file_path = cx.update(|cx| {
+                if worktree.read(cx).is_single_file() {
+                    Some(worktree.read(cx).abs_path())
+                } else {
+                    None
+                }
+            })?;
+            let path_string = single_file_path
+                .as_ref()
+                .map(|path| path.to_string_lossy())
+                .unwrap_or_else(|| path.display(PathStyle::local()));
+            let buffer = match load_file
+                .await
+                .with_context(|| format!("Opening path \"{path_string}\""))
+            {
+                Ok(loaded) => {
+                    let reservation = cx.reserve_entity::<Buffer>()?;
+                    let buffer_id = BufferId::from(reservation.entity_id().as_non_zero_u64());
+                    let text_buffer = cx
+                        .background_spawn(async move {
+                            text::Buffer::new(ReplicaId::LOCAL, buffer_id, loaded.text)
+                        })
+                        .await;
+                    cx.insert_entity(reservation, |_| {
+                        Buffer::build(text_buffer, Some(loaded.file), Capability::ReadWrite)
+                    })?
+                }
                 Err(error) if is_not_found_error(&error) => cx.new(|cx| {
                     let buffer_id = BufferId::from(cx.entity_id().as_non_zero_u64());
                     let text_buffer = text::Buffer::new(ReplicaId::LOCAL, buffer_id, "");
@@ -652,9 +662,9 @@ impl LocalBufferStore {
                         })),
                         Capability::ReadWrite,
                     )
-                }),
-                Err(e) => Err(e),
-            }?;
+                })?,
+                Err(e) => return Err(e),
+            };
             this.update(cx, |this, cx| {
                 this.add_buffer(buffer.clone(), cx)?;
                 let buffer_id = buffer.read(cx).remote_id();
@@ -835,6 +845,7 @@ impl BufferStore {
 
                 entry
                     .insert(
+                        // todo(lw): hot foreground spawn
                         cx.spawn(async move |this, cx| {
                             let load_result = load_buffer.await;
                             this.update(cx, |this, cx| {
@@ -904,7 +915,14 @@ impl BufferStore {
         };
         cx.spawn(async move |this, cx| {
             task.await?;
-            this.update(cx, |_, cx| {
+            this.update(cx, |this, cx| {
+                old_file.clone().and_then(|file| {
+                    this.path_to_buffer_id.remove(&ProjectPath {
+                        worktree_id: file.worktree_id(cx),
+                        path: file.path().clone(),
+                    })
+                });
+
                 cx.emit(BufferStoreEvent::BufferChangedFilePath { buffer, old_file });
             })
         })
@@ -1123,7 +1141,7 @@ impl BufferStore {
                     })
                     .log_err();
             }
-            BufferEvent::LanguageChanged => {}
+            BufferEvent::LanguageChanged(_) => {}
             _ => {}
         }
     }

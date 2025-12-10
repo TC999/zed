@@ -1,11 +1,11 @@
 use std::{
+    cell::LazyCell,
+    collections::BTreeSet,
     io::{BufRead, BufReader},
-    path::Path,
+    ops::Range,
+    path::{Path, PathBuf},
     pin::pin,
-    sync::{
-        Arc,
-        atomic::{AtomicUsize, Ordering},
-    },
+    sync::Arc,
 };
 
 use anyhow::Context;
@@ -23,8 +23,8 @@ use smol::{
 };
 
 use text::BufferId;
-use util::{ResultExt, maybe, paths::compare_rel_paths};
-use worktree::{Entry, ProjectEntryId, Snapshot, Worktree};
+use util::{ResultExt, maybe, paths::compare_rel_paths, rel_path::RelPath};
+use worktree::{Entry, ProjectEntryId, Snapshot, Worktree, WorktreeSettings};
 
 use crate::{
     Project, ProjectItem, ProjectPath, RemotelyCreatedModels,
@@ -93,9 +93,6 @@ enum FindSearchCandidates {
         /// based on disk contents of a buffer. This step is not performed for buffers we already have in memory.
         confirm_contents_will_match_tx: Sender<MatchingEntry>,
         confirm_contents_will_match_rx: Receiver<MatchingEntry>,
-        /// Of those that contain at least one match (or are already in memory), look for rest of matches (and figure out their ranges).
-        /// But wait - first, we need to go back to the main thread to open a buffer (& create an entity for it).
-        get_buffer_for_full_scan_tx: Sender<ProjectPath>,
     },
     Remote,
     OpenBuffersOnly,
@@ -164,7 +161,7 @@ impl Search {
             } else if let Some(entry_id) = buffer.entry_id(cx) {
                 open_buffers.insert(entry_id);
             } else {
-                self.limit -= self.limit.saturating_sub(1);
+                self.limit = self.limit.saturating_sub(1);
                 unnamed_buffers.push(handle)
             };
         }
@@ -180,7 +177,7 @@ impl Search {
 
                 let (find_all_matches_tx, find_all_matches_rx) =
                     bounded(MAX_CONCURRENT_BUFFER_OPENS);
-
+                let query = Arc::new(query);
                 let (candidate_searcher, tasks) = match self.kind {
                     SearchKind::OpenBuffersOnly => {
                         let Ok(open_buffers) = cx.update(|cx| self.all_loaded_buffers(&query, cx))
@@ -209,11 +206,10 @@ impl Search {
                         let (sorted_search_results_tx, sorted_search_results_rx) = unbounded();
 
                         let (input_paths_tx, input_paths_rx) = unbounded();
-
                         let tasks = vec![
                             cx.spawn(Self::provide_search_paths(
                                 std::mem::take(worktrees),
-                                query.include_ignored(),
+                                query.clone(),
                                 input_paths_tx,
                                 sorted_search_results_tx,
                             ))
@@ -227,7 +223,7 @@ impl Search {
                             .boxed_local(),
                             cx.background_spawn(Self::maintain_sorted_search_results(
                                 sorted_search_results_rx,
-                                get_buffer_for_full_scan_tx.clone(),
+                                get_buffer_for_full_scan_tx,
                                 self.limit,
                             ))
                             .boxed_local(),
@@ -235,7 +231,6 @@ impl Search {
                         (
                             FindSearchCandidates::Local {
                                 fs,
-                                get_buffer_for_full_scan_tx,
                                 confirm_contents_will_match_tx,
                                 confirm_contents_will_match_rx,
                                 input_paths_rx,
@@ -268,7 +263,6 @@ impl Search {
                             .spawn(async move |cx| {
                                 let _ = maybe!(async move {
                                     let response = request.await?;
-
                                     for buffer_id in response.buffer_ids {
                                         let buffer_id = BufferId::new(buffer_id)?;
                                         let buffer = buffer_store
@@ -293,8 +287,7 @@ impl Search {
                     }
                 };
 
-                let matches_count = AtomicUsize::new(0);
-                let matched_buffer_count = AtomicUsize::new(0);
+                let should_find_all_matches = !tx.is_closed();
 
                 let worker_pool = executor.scoped(|scope| {
                     let num_cpus = executor.num_cpus();
@@ -304,27 +297,53 @@ impl Search {
                         let worker = Worker {
                             query: &query,
                             open_buffers: &open_buffers,
-                            matched_buffer_count: &matched_buffer_count,
-                            matches_count: &matches_count,
                             candidates: candidate_searcher.clone(),
                             find_all_matches_rx: find_all_matches_rx.clone(),
-                            publish_matches: tx.clone(),
                         };
                         scope.spawn(worker.run());
                     }
-                    drop(tx);
+
                     drop(find_all_matches_rx);
                     drop(candidate_searcher);
                 });
 
-                let buffer_snapshots = Self::grab_buffer_snapshots(
-                    grab_buffer_snapshot_rx,
-                    find_all_matches_tx,
-                    cx.clone(),
-                );
+                let (sorted_matches_tx, sorted_matches_rx) = unbounded();
+                // The caller of `into_handle` decides whether they're interested in all matches (files that matched + all matching ranges) or
+                // just the files. *They are using the same stream as the guts of the project search do*.
+                // This means that we cannot grab values off of that stream unless it's strictly needed for making a progress in project search.
+                //
+                // Grabbing buffer snapshots is only necessary when we're looking for all matches. If the caller decided that they're not interested
+                // in all matches, running that task unconditionally would hinder caller's ability to observe all matching file paths.
+                let buffer_snapshots = if should_find_all_matches {
+                    Some(
+                        Self::grab_buffer_snapshots(
+                            grab_buffer_snapshot_rx,
+                            find_all_matches_tx,
+                            sorted_matches_tx,
+                            cx.clone(),
+                        )
+                        .boxed_local(),
+                    )
+                } else {
+                    drop(find_all_matches_tx);
+
+                    None
+                };
+                let ensure_matches_are_reported_in_order = if should_find_all_matches {
+                    Some(
+                        Self::ensure_matched_ranges_are_reported_in_order(sorted_matches_rx, tx)
+                            .boxed_local(),
+                    )
+                } else {
+                    drop(tx);
+                    None
+                };
+
                 futures::future::join_all(
-                    [worker_pool.boxed_local(), buffer_snapshots.boxed_local()]
+                    [worker_pool.boxed_local()]
                         .into_iter()
+                        .chain(buffer_snapshots)
+                        .chain(ensure_matches_are_reported_in_order)
                         .chain(tasks),
                 )
                 .await;
@@ -340,26 +359,30 @@ impl Search {
 
     fn provide_search_paths(
         worktrees: Vec<Entity<Worktree>>,
-        include_ignored: bool,
+        query: Arc<SearchQuery>,
         tx: Sender<InputPath>,
         results: Sender<oneshot::Receiver<ProjectPath>>,
     ) -> impl AsyncFnOnce(&mut AsyncApp) {
         async move |cx| {
             _ = maybe!(async move {
+                let gitignored_tracker = PathInclusionMatcher::new(query.clone());
                 for worktree in worktrees {
                     let (mut snapshot, worktree_settings) = worktree
                         .read_with(cx, |this, _| {
                             Some((this.snapshot(), this.as_local()?.settings()))
                         })?
                         .context("The worktree is not local")?;
-                    if include_ignored {
+                    if query.include_ignored() {
                         // Pre-fetch all of the ignored directories as they're going to be searched.
                         let mut entries_to_refresh = vec![];
-                        for entry in snapshot.entries(include_ignored, 0) {
-                            if entry.is_ignored && entry.kind.is_unloaded() {
-                                if !worktree_settings.is_path_excluded(&entry.path) {
-                                    entries_to_refresh.push(entry.path.clone());
-                                }
+
+                        for entry in snapshot.entries(query.include_ignored(), 0) {
+                            if gitignored_tracker.should_scan_gitignored_dir(
+                                entry,
+                                &snapshot,
+                                &worktree_settings,
+                            ) {
+                                entries_to_refresh.push(entry.path.clone());
                             }
                         }
                         let barrier = worktree.update(cx, |this, _| {
@@ -378,8 +401,9 @@ impl Search {
                     cx.background_executor()
                         .scoped(|scope| {
                             scope.spawn(async {
-                                for entry in snapshot.files(include_ignored, 0) {
+                                for entry in snapshot.files(query.include_ignored(), 0) {
                                     let (should_scan_tx, should_scan_rx) = oneshot::channel();
+
                                     let Ok(_) = tx
                                         .send(InputPath {
                                             entry: entry.clone(),
@@ -413,7 +437,7 @@ impl Search {
         let mut matched = 0;
         while let Some(mut next_path_result) = rx.next().await {
             let Some(successful_path) = next_path_result.next().await else {
-                // This math did not produce a match, hence skip it.
+                // This file did not produce a match, hence skip it.
                 continue;
             };
             if paths_for_full_scan.send(successful_path).await.is_err() {
@@ -456,15 +480,52 @@ impl Search {
 
     async fn grab_buffer_snapshots(
         rx: Receiver<Entity<Buffer>>,
-        find_all_matches_tx: Sender<(Entity<Buffer>, BufferSnapshot)>,
+        find_all_matches_tx: Sender<(
+            Entity<Buffer>,
+            BufferSnapshot,
+            oneshot::Sender<(Entity<Buffer>, Vec<Range<language::Anchor>>)>,
+        )>,
+        results: Sender<oneshot::Receiver<(Entity<Buffer>, Vec<Range<language::Anchor>>)>>,
         mut cx: AsyncApp,
     ) {
         _ = maybe!(async move {
             while let Ok(buffer) = rx.recv().await {
                 let snapshot = buffer.read_with(&mut cx, |this, _| this.snapshot())?;
-                find_all_matches_tx.send((buffer, snapshot)).await?;
+                let (tx, rx) = oneshot::channel();
+                find_all_matches_tx.send((buffer, snapshot, tx)).await?;
+                results.send(rx).await?;
             }
+            debug_assert!(rx.is_empty());
             Result::<_, anyhow::Error>::Ok(())
+        })
+        .await;
+    }
+
+    async fn ensure_matched_ranges_are_reported_in_order(
+        rx: Receiver<oneshot::Receiver<(Entity<Buffer>, Vec<Range<language::Anchor>>)>>,
+        tx: Sender<SearchResult>,
+    ) {
+        use postage::stream::Stream;
+        _ = maybe!(async move {
+            let mut matched_buffers = 0;
+            let mut matches = 0;
+            while let Ok(mut next_buffer_matches) = rx.recv().await {
+                let Some((buffer, ranges)) = next_buffer_matches.recv().await else {
+                    continue;
+                };
+
+                if matched_buffers > Search::MAX_SEARCH_RESULT_FILES
+                    || matches > Search::MAX_SEARCH_RESULT_RANGES
+                {
+                    _ = tx.send(SearchResult::LimitReached).await;
+                    break;
+                }
+                matched_buffers += 1;
+                matches += ranges.len();
+
+                _ = tx.send(SearchResult::Buffer { buffer, ranges }).await?;
+            }
+            anyhow::Ok(())
         })
         .await;
     }
@@ -478,7 +539,7 @@ impl Search {
             .filter(|buffer| {
                 let b = buffer.read(cx);
                 if let Some(file) = b.file() {
-                    if !search_query.match_path(file.path().as_std_path()) {
+                    if !search_query.match_path(file.path()) {
                         return false;
                     }
                     if !search_query.include_ignored()
@@ -511,23 +572,23 @@ impl Search {
 
 struct Worker<'search> {
     query: &'search SearchQuery,
-    matched_buffer_count: &'search AtomicUsize,
-    matches_count: &'search AtomicUsize,
     open_buffers: &'search HashSet<ProjectEntryId>,
     candidates: FindSearchCandidates,
     /// Ok, we're back in background: run full scan & find all matches in a given buffer snapshot.
-    find_all_matches_rx: Receiver<(Entity<Buffer>, BufferSnapshot)>,
-    /// Cool, we have results; let's share them with the world.
-    publish_matches: Sender<SearchResult>,
+    /// Then, when you're done, share them via the channel you were given.
+    find_all_matches_rx: Receiver<(
+        Entity<Buffer>,
+        BufferSnapshot,
+        oneshot::Sender<(Entity<Buffer>, Vec<Range<language::Anchor>>)>,
+    )>,
 }
 
 impl Worker<'_> {
-    async fn run(mut self) {
+    async fn run(self) {
         let (
             input_paths_rx,
             confirm_contents_will_match_rx,
             mut confirm_contents_will_match_tx,
-            mut get_buffer_for_full_scan_tx,
             fs,
         ) = match self.candidates {
             FindSearchCandidates::Local {
@@ -535,22 +596,18 @@ impl Worker<'_> {
                 input_paths_rx,
                 confirm_contents_will_match_rx,
                 confirm_contents_will_match_tx,
-                get_buffer_for_full_scan_tx,
             } => (
                 input_paths_rx,
                 confirm_contents_will_match_rx,
                 confirm_contents_will_match_tx,
-                get_buffer_for_full_scan_tx,
                 Some(fs),
             ),
-            FindSearchCandidates::Remote | FindSearchCandidates::OpenBuffersOnly => (
-                unbounded().1,
-                unbounded().1,
-                unbounded().0,
-                unbounded().0,
-                None,
-            ),
+            FindSearchCandidates::Remote | FindSearchCandidates::OpenBuffersOnly => {
+                (unbounded().1, unbounded().1, unbounded().0, None)
+            }
         };
+        // WorkerA: grabs a request for "find all matches in file/a" <- takes 5 minutes
+        // right after: WorkerB: grabs a request for "find all matches in file/b" <- takes 5 seconds
         let mut find_all_matches = pin!(self.find_all_matches_rx.fuse());
         let mut find_first_match = pin!(confirm_contents_will_match_rx.fuse());
         let mut scan_path = pin!(input_paths_rx.fuse());
@@ -560,11 +617,7 @@ impl Worker<'_> {
                 query: self.query,
                 open_entries: &self.open_buffers,
                 fs: fs.as_deref(),
-                matched_buffer_count: self.matched_buffer_count,
-                matches_count: self.matches_count,
                 confirm_contents_will_match_tx: &confirm_contents_will_match_tx,
-                get_buffer_for_full_scan_tx: &get_buffer_for_full_scan_tx,
-                publish_matches: &self.publish_matches,
             };
             // Whenever we notice that some step of a pipeline is closed, we don't want to close subsequent
             // steps straight away. Another worker might be about to produce a value that will
@@ -572,28 +625,15 @@ impl Worker<'_> {
             // That way, we'll only ever close a next-stage channel when ALL workers do so.
             select_biased! {
                 find_all_matches = find_all_matches.next() => {
-
-                    if self.publish_matches.is_closed() {
-                        break;
-                    }
                     let Some(matches) = find_all_matches else {
-                        self.publish_matches = bounded(1).0;
                         continue;
                     };
-                    let result = handler.handle_find_all_matches(matches).await;
-                    if let Some(_should_bail) = result {
-
-                        self.publish_matches = bounded(1).0;
-                        continue;
-                    }
+                    handler.handle_find_all_matches(matches).await;
                 },
                 find_first_match = find_first_match.next() => {
                     if let Some(buffer_with_at_least_one_match) = find_first_match {
                         handler.handle_find_first_match(buffer_with_at_least_one_match).await;
-                    } else {
-                        get_buffer_for_full_scan_tx = bounded(1).0;
                     }
-
                 },
                 scan_path = scan_path.next() => {
                     if let Some(path_to_scan) = scan_path {
@@ -617,21 +657,18 @@ struct RequestHandler<'worker> {
     query: &'worker SearchQuery,
     fs: Option<&'worker dyn Fs>,
     open_entries: &'worker HashSet<ProjectEntryId>,
-    matched_buffer_count: &'worker AtomicUsize,
-    matches_count: &'worker AtomicUsize,
-
     confirm_contents_will_match_tx: &'worker Sender<MatchingEntry>,
-    get_buffer_for_full_scan_tx: &'worker Sender<ProjectPath>,
-    publish_matches: &'worker Sender<SearchResult>,
 }
-
-struct LimitReached;
 
 impl RequestHandler<'_> {
     async fn handle_find_all_matches(
         &self,
-        (buffer, snapshot): (Entity<Buffer>, BufferSnapshot),
-    ) -> Option<LimitReached> {
+        (buffer, snapshot, mut report_matches): (
+            Entity<Buffer>,
+            BufferSnapshot,
+            oneshot::Sender<(Entity<Buffer>, Vec<Range<language::Anchor>>)>,
+        ),
+    ) {
         let ranges = self
             .query
             .search(&snapshot, None)
@@ -640,24 +677,9 @@ impl RequestHandler<'_> {
             .map(|range| snapshot.anchor_before(range.start)..snapshot.anchor_after(range.end))
             .collect::<Vec<_>>();
 
-        let matched_ranges = ranges.len();
-        if self.matched_buffer_count.fetch_add(1, Ordering::Release)
-            > Search::MAX_SEARCH_RESULT_FILES
-            || self
-                .matches_count
-                .fetch_add(matched_ranges, Ordering::Release)
-                > Search::MAX_SEARCH_RESULT_RANGES
-        {
-            _ = self.publish_matches.send(SearchResult::LimitReached).await;
-            Some(LimitReached)
-        } else {
-            _ = self
-                .publish_matches
-                .send(SearchResult::Buffer { buffer, ranges })
-                .await;
-            None
-        }
+        _ = report_matches.send((buffer, ranges)).await;
     }
+
     async fn handle_find_first_match(&self, mut entry: MatchingEntry) {
         _=maybe!(async move {
             let abs_path = entry.worktree_root.join(entry.path.path.as_std_path());
@@ -691,9 +713,8 @@ impl RequestHandler<'_> {
         _ = maybe!(async move {
             let InputPath {
                 entry,
-
                 snapshot,
-                should_scan_tx,
+                mut should_scan_tx,
             } = req;
 
             if entry.is_fifo || !entry.is_file() {
@@ -702,11 +723,11 @@ impl RequestHandler<'_> {
 
             if self.query.filters_path() {
                 let matched_path = if self.query.match_full_paths() {
-                    let mut full_path = snapshot.root_name().as_std_path().to_owned();
-                    full_path.push(entry.path.as_std_path());
+                    let mut full_path = snapshot.root_name().to_owned();
+                    full_path.push(&entry.path);
                     self.query.match_path(&full_path)
                 } else {
-                    self.query.match_path(entry.path.as_std_path())
+                    self.query.match_path(&entry.path)
                 };
                 if !matched_path {
                     return Ok(());
@@ -716,7 +737,7 @@ impl RequestHandler<'_> {
             if self.open_entries.contains(&entry.id) {
                 // The buffer is already in memory and that's the version we want to scan;
                 // hence skip the dilly-dally and look for all matches straight away.
-                self.get_buffer_for_full_scan_tx
+                should_scan_tx
                     .send(ProjectPath {
                         worktree_id: snapshot.id(),
                         path: entry.path.clone(),
@@ -751,4 +772,231 @@ struct MatchingEntry {
     worktree_root: Arc<Path>,
     path: ProjectPath,
     should_scan_tx: oneshot::Sender<ProjectPath>,
+}
+
+/// This struct encapsulates the logic to decide whether a given gitignored directory should be
+/// scanned based on include/exclude patterns of a search query (as include/exclude parameters may match paths inside it).
+/// It is kind-of doing an inverse of glob. Given a glob pattern like `src/**/` and a parent path like `src`, we need to decide whether the parent
+/// may contain glob hits.
+struct PathInclusionMatcher {
+    included: BTreeSet<PathBuf>,
+    query: Arc<SearchQuery>,
+}
+
+impl PathInclusionMatcher {
+    fn new(query: Arc<SearchQuery>) -> Self {
+        let mut included = BTreeSet::new();
+        // To do an inverse glob match, we split each glob into it's prefix and the glob part.
+        // For example, `src/**/*.rs` becomes `src/` and `**/*.rs`. The glob part gets dropped.
+        // Then, when checking whether a given directory should be scanned, we check whether it is a non-empty substring of any glob prefix.
+        if query.filters_path() {
+            included.extend(
+                query
+                    .files_to_include()
+                    .sources()
+                    .flat_map(|glob| Some(wax::Glob::new(glob).ok()?.partition().0)),
+            );
+        }
+        Self { included, query }
+    }
+
+    fn should_scan_gitignored_dir(
+        &self,
+        entry: &Entry,
+        snapshot: &Snapshot,
+        worktree_settings: &WorktreeSettings,
+    ) -> bool {
+        if !entry.is_ignored || !entry.kind.is_unloaded() {
+            return false;
+        }
+        if !self.query.include_ignored() {
+            return false;
+        }
+        if worktree_settings.is_path_excluded(&entry.path) {
+            return false;
+        }
+        if !self.query.filters_path() {
+            return true;
+        }
+
+        let as_abs_path = LazyCell::new(move || snapshot.absolutize(&entry.path));
+        let entry_path = &entry.path;
+        // 3. Check Exclusions (Pruning)
+        // If the current path is a child of an excluded path, we stop.
+        let is_excluded = self.path_is_definitely_excluded(&entry_path, snapshot);
+
+        if is_excluded {
+            return false;
+        }
+
+        // 4. Check Inclusions (Traversal)
+        if self.included.is_empty() {
+            return true;
+        }
+
+        // We scan if the current path is a descendant of an include prefix
+        // OR if the current path is an ancestor of an include prefix (we need to go deeper to find it).
+        let is_included = self.included.iter().any(|prefix| {
+            let (prefix_matches_entry, entry_matches_prefix) = if prefix.is_absolute() {
+                (
+                    prefix.starts_with(&**as_abs_path),
+                    as_abs_path.starts_with(prefix),
+                )
+            } else {
+                RelPath::new(prefix, snapshot.path_style()).map_or((false, false), |prefix| {
+                    (
+                        prefix.starts_with(entry_path),
+                        entry_path.starts_with(&prefix),
+                    )
+                })
+            };
+
+            // Logic:
+            // 1. entry_matches_prefix: We are inside the target zone (e.g. glob: src/, current: src/lib/). Keep scanning.
+            // 2. prefix_matches_entry: We are above the target zone (e.g. glob: src/foo/, current: src/). Keep scanning to reach foo.
+            prefix_matches_entry || entry_matches_prefix
+        });
+
+        is_included
+    }
+    fn path_is_definitely_excluded(&self, path: &RelPath, snapshot: &Snapshot) -> bool {
+        if !self.query.files_to_exclude().sources().next().is_none() {
+            let mut path = if self.query.match_full_paths() {
+                let mut full_path = snapshot.root_name().to_owned();
+                full_path.push(path);
+                full_path
+            } else {
+                path.to_owned()
+            };
+            loop {
+                if self.query.files_to_exclude().is_match(&path) {
+                    return true;
+                } else if !path.pop() {
+                    return false;
+                }
+            }
+        } else {
+            false
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use fs::FakeFs;
+    use serde_json::json;
+    use settings::Settings;
+    use util::{
+        path,
+        paths::{PathMatcher, PathStyle},
+        rel_path::RelPath,
+    };
+    use worktree::{Entry, EntryKind, WorktreeSettings};
+
+    use crate::{
+        Project, project_search::PathInclusionMatcher, project_tests::init_test,
+        search::SearchQuery,
+    };
+
+    #[gpui::test]
+    async fn test_path_inclusion_matcher(cx: &mut gpui::TestAppContext) {
+        init_test(cx);
+
+        let fs = FakeFs::new(cx.background_executor.clone());
+        fs.insert_tree(
+            "/root",
+            json!({
+                ".gitignore": "src/data/\n",
+                "src": {
+                    "data": {
+                        "main.csv": "field_1,field_2,field_3",
+                    },
+                    "lib": {
+                        "main.txt": "Are you familiar with fields?",
+                    },
+                },
+            }),
+        )
+        .await;
+
+        let project = Project::test(fs.clone(), [path!("/root").as_ref()], cx).await;
+        let worktree = project.update(cx, |project, cx| project.worktrees(cx).next().unwrap());
+        let (worktree_settings, worktree_snapshot) = worktree.update(cx, |worktree, cx| {
+            let settings_location = worktree.settings_location(cx);
+            return (
+                WorktreeSettings::get(Some(settings_location), cx).clone(),
+                worktree.snapshot(),
+            );
+        });
+
+        // Manually create a test entry for the gitignored directory since it won't
+        // be loaded by the worktree
+        let entry = Entry {
+            id: ProjectEntryId::from_proto(1),
+            kind: EntryKind::UnloadedDir,
+            path: Arc::from(RelPath::unix(Path::new("src/data")).unwrap()),
+            inode: 0,
+            mtime: None,
+            canonical_path: None,
+            is_ignored: true,
+            is_hidden: false,
+            is_always_included: false,
+            is_external: false,
+            is_private: false,
+            size: 0,
+            char_bag: Default::default(),
+            is_fifo: false,
+        };
+
+        // 1. Test searching for `field`, including ignored files without any
+        // inclusion and exclusion filters.
+        let include_ignored = true;
+        let files_to_include = PathMatcher::default();
+        let files_to_exclude = PathMatcher::default();
+        let match_full_paths = false;
+        let search_query = SearchQuery::text(
+            "field",
+            false,
+            false,
+            include_ignored,
+            files_to_include,
+            files_to_exclude,
+            match_full_paths,
+            None,
+        )
+        .unwrap();
+
+        let path_matcher = PathInclusionMatcher::new(Arc::new(search_query));
+        assert!(path_matcher.should_scan_gitignored_dir(
+            &entry,
+            &worktree_snapshot,
+            &worktree_settings
+        ));
+
+        // 2. Test searching for `field`, including ignored files but updating
+        // `files_to_include` to only include files under `src/lib`.
+        let include_ignored = true;
+        let files_to_include = PathMatcher::new(vec!["src/lib"], PathStyle::Posix).unwrap();
+        let files_to_exclude = PathMatcher::default();
+        let match_full_paths = false;
+        let search_query = SearchQuery::text(
+            "field",
+            false,
+            false,
+            include_ignored,
+            files_to_include,
+            files_to_exclude,
+            match_full_paths,
+            None,
+        )
+        .unwrap();
+
+        let path_matcher = PathInclusionMatcher::new(Arc::new(search_query));
+        assert!(!path_matcher.should_scan_gitignored_dir(
+            &entry,
+            &worktree_snapshot,
+            &worktree_settings
+        ));
+    }
 }

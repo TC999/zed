@@ -9,11 +9,21 @@ use rope::{Point, Rope};
 use sum_tree::Bias;
 use util::RandomCharIter;
 
-/// Generate a random text of the given length using the provided RNG.
+/// Returns a biased random string whose UTF-8 length is close to but no more than `len` bytes.
 ///
-/// *Note*: The length is in *characters*, not bytes.
-fn generate_random_text(rng: &mut StdRng, text_len: usize) -> String {
-    RandomCharIter::new(rng).take(text_len).collect()
+/// The string is biased towards characters expected to occur in text or likely to exercise edge
+/// cases.
+fn generate_random_text(rng: &mut StdRng, len: usize) -> String {
+    let mut str = String::with_capacity(len);
+    let mut chars = RandomCharIter::new(rng);
+    loop {
+        let ch = chars.next().unwrap();
+        if str.len() + ch.len_utf8() > len {
+            break;
+        }
+        str.push(ch);
+    }
+    str
 }
 
 fn generate_random_rope(rng: &mut StdRng, text_len: usize) -> Rope {
@@ -227,6 +237,35 @@ fn rope_benchmarks(c: &mut Criterion) {
             );
         });
     }
+    group.finish();
+
+    let mut group = c.benchmark_group("append many");
+    group.throughput(Throughput::Bytes(128 * 100_000));
+
+    group.bench_function("small to large", |b| {
+        b.iter(|| {
+            let mut rope = Rope::new();
+            let small = Rope::from("A".repeat(128));
+            for _ in 0..100_000 {
+                rope.append(small.clone());
+            }
+            assert_eq!(rope.len(), 128 * 100_000);
+        });
+    });
+
+    group.bench_function("large to small", |b| {
+        b.iter(|| {
+            let mut rope = Rope::new();
+            let small = Rope::from("A".repeat(128));
+            for _ in 0..100_000 {
+                let large = rope;
+                rope = small.clone();
+                rope.append(large);
+            }
+            assert_eq!(rope.len(), 128 * 100_000);
+        });
+    });
+
     group.finish();
 }
 

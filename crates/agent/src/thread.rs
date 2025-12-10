@@ -1,9 +1,8 @@
 use crate::{
     ContextServerRegistry, CopyPathTool, CreateDirectoryTool, DbLanguageModel, DbThread,
-    DeletePathTool, DiagnosticsTool, EditFileTool, FetchTool, FindPathTool, GitState, GrepTool,
+    DeletePathTool, DiagnosticsTool, EditFileTool, FetchTool, FindPathTool, GrepTool,
     ListDirectoryTool, MovePathTool, NowTool, OpenTool, ProjectSnapshot, ReadFileTool,
     SystemPromptTemplate, Template, Templates, TerminalTool, ThinkingTool, WebSearchTool,
-    WorktreeSnapshot,
 };
 use acp_thread::{MentionUri, UserMessageId};
 use action_log::ActionLog;
@@ -16,7 +15,7 @@ use agent_settings::{
 use anyhow::{Context as _, Result, anyhow};
 use chrono::{DateTime, Utc};
 use client::{ModelRequestUsage, RequestUsage, UserStore};
-use cloud_llm_client::{CompletionIntent, CompletionRequestStatus, Plan, UsageLimit};
+use cloud_llm_client::{CompletionIntent, Plan, UsageLimit};
 use collections::{HashMap, HashSet, IndexMap};
 use fs::Fs;
 use futures::stream;
@@ -26,25 +25,22 @@ use futures::{
     future::Shared,
     stream::FuturesUnordered,
 };
-use git::repository::DiffType;
 use gpui::{
     App, AppContext, AsyncApp, Context, Entity, EventEmitter, SharedString, Task, WeakEntity,
 };
 use language_model::{
     LanguageModel, LanguageModelCompletionError, LanguageModelCompletionEvent, LanguageModelExt,
-    LanguageModelImage, LanguageModelProviderId, LanguageModelRegistry, LanguageModelRequest,
-    LanguageModelRequestMessage, LanguageModelRequestTool, LanguageModelToolResult,
-    LanguageModelToolResultContent, LanguageModelToolSchemaFormat, LanguageModelToolUse,
-    LanguageModelToolUseId, Role, SelectedModel, StopReason, TokenUsage, ZED_CLOUD_PROVIDER_ID,
+    LanguageModelId, LanguageModelImage, LanguageModelProviderId, LanguageModelRegistry,
+    LanguageModelRequest, LanguageModelRequestMessage, LanguageModelRequestTool,
+    LanguageModelToolResult, LanguageModelToolResultContent, LanguageModelToolSchemaFormat,
+    LanguageModelToolUse, LanguageModelToolUseId, Role, SelectedModel, StopReason, TokenUsage,
+    ZED_CLOUD_PROVIDER_ID,
 };
-use project::{
-    Project,
-    git_store::{GitStore, RepositoryState},
-};
+use project::Project;
 use prompt_store::ProjectContext;
 use schemars::{JsonSchema, Schema};
 use serde::{Deserialize, Serialize};
-use settings::{Settings, update_settings_file};
+use settings::{LanguageModelSelection, Settings, update_settings_file};
 use smol::stream::StreamExt;
 use std::{
     collections::BTreeMap,
@@ -55,7 +51,7 @@ use std::{
     time::{Duration, Instant},
 };
 use std::{fmt::Write, path::PathBuf};
-use util::{ResultExt, debug_panic, markdown::MarkdownCodeBlock};
+use util::{ResultExt, debug_panic, markdown::MarkdownCodeBlock, paths::PathStyle};
 use uuid::Uuid;
 
 const TOOL_CANCELED_MESSAGE: &str = "Tool canceled by user";
@@ -117,6 +113,7 @@ impl Message {
                 role: Role::User,
                 content: vec!["Continue where you left off".into()],
                 cache: false,
+                reasoning_details: None,
             }],
         }
     }
@@ -181,6 +178,7 @@ impl UserMessage {
             role: Role::User,
             content: Vec::with_capacity(self.content.len()),
             cache: false,
+            reasoning_details: None,
         };
 
         const OPEN_CONTEXT: &str = "<context>\n\
@@ -448,6 +446,7 @@ impl AgentMessage {
             role: Role::Assistant,
             content: Vec::with_capacity(self.content.len()),
             cache: false,
+            reasoning_details: self.reasoning_details.clone(),
         };
         for chunk in &self.content {
             match chunk {
@@ -483,6 +482,7 @@ impl AgentMessage {
             role: Role::User,
             content: Vec::new(),
             cache: false,
+            reasoning_details: None,
         };
 
         for tool_result in self.tool_results.values() {
@@ -512,6 +512,7 @@ impl AgentMessage {
 pub struct AgentMessage {
     pub content: Vec<AgentMessageContent>,
     pub tool_results: IndexMap<LanguageModelToolUseId, LanguageModelToolResult>,
+    pub reasoning_details: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -611,17 +612,16 @@ pub struct Thread {
     pub(crate) prompt_capabilities_rx: watch::Receiver<acp::PromptCapabilities>,
     pub(crate) project: Entity<Project>,
     pub(crate) action_log: Entity<ActionLog>,
+    /// Tracks the last time files were read by the agent, to detect external modifications
+    pub(crate) file_read_times: HashMap<PathBuf, fs::MTime>,
 }
 
 impl Thread {
     fn prompt_capabilities(model: Option<&dyn LanguageModel>) -> acp::PromptCapabilities {
         let image = model.map_or(true, |model| model.supports_images());
-        acp::PromptCapabilities {
-            meta: None,
-            image,
-            audio: false,
-            embedded_context: true,
-        }
+        acp::PromptCapabilities::new()
+            .image(image)
+            .embedded_context(true)
     }
 
     pub fn new(
@@ -637,7 +637,7 @@ impl Thread {
         let (prompt_capabilities_tx, prompt_capabilities_rx) =
             watch::channel(Self::prompt_capabilities(model.as_deref()));
         Self {
-            id: acp::SessionId(uuid::Uuid::new_v4().to_string().into()),
+            id: acp::SessionId::new(uuid::Uuid::new_v4().to_string()),
             prompt_id: PromptId::new(),
             updated_at: Utc::now(),
             title: None,
@@ -669,6 +669,7 @@ impl Thread {
             prompt_capabilities_rx,
             project,
             action_log,
+            file_read_times: HashMap::default(),
         }
     }
 
@@ -733,24 +734,24 @@ impl Thread {
         let Some(tool) = tool else {
             stream
                 .0
-                .unbounded_send(Ok(ThreadEvent::ToolCall(acp::ToolCall {
-                    meta: None,
-                    id: acp::ToolCallId(tool_use.id.to_string().into()),
-                    title: tool_use.name.to_string(),
-                    kind: acp::ToolKind::Other,
-                    status: acp::ToolCallStatus::Failed,
-                    content: Vec::new(),
-                    locations: Vec::new(),
-                    raw_input: Some(tool_use.input.clone()),
-                    raw_output: None,
-                })))
+                .unbounded_send(Ok(ThreadEvent::ToolCall(
+                    acp::ToolCall::new(tool_use.id.to_string(), tool_use.name.to_string())
+                        .status(acp::ToolCallStatus::Failed)
+                        .raw_input(tool_use.input.clone()),
+                )))
                 .ok();
             return;
         };
 
         let title = tool.initial_title(tool_use.input.clone(), cx);
         let kind = tool.kind();
-        stream.send_tool_call(&tool_use.id, title, kind, tool_use.input.clone());
+        stream.send_tool_call(
+            &tool_use.id,
+            &tool_use.name,
+            title,
+            kind,
+            tool_use.input.clone(),
+        );
 
         let output = tool_result
             .as_ref()
@@ -767,8 +768,8 @@ impl Thread {
 
         stream.update_tool_call_fields(
             &tool_use.id,
-            acp::ToolCallUpdateFields {
-                status: Some(
+            acp::ToolCallUpdateFields::new()
+                .status(
                     tool_result
                         .as_ref()
                         .map_or(acp::ToolCallStatus::Failed, |result| {
@@ -778,10 +779,8 @@ impl Thread {
                                 acp::ToolCallStatus::Completed
                             }
                         }),
-                ),
-                raw_output: output,
-                ..Default::default()
-            },
+                )
+                .raw_output(output),
         );
     }
 
@@ -797,7 +796,8 @@ impl Thread {
         let profile_id = db_thread
             .profile
             .unwrap_or_else(|| AgentSettings::get_global(cx).default_profile.clone());
-        let model = LanguageModelRegistry::global(cx).update(cx, |registry, cx| {
+
+        let mut model = LanguageModelRegistry::global(cx).update(cx, |registry, cx| {
             db_thread
                 .model
                 .and_then(|model| {
@@ -810,6 +810,16 @@ impl Thread {
                 .or_else(|| registry.default_model())
                 .map(|model| model.model)
         });
+
+        if model.is_none() {
+            model = Self::resolve_profile_model(&profile_id, cx);
+        }
+        if model.is_none() {
+            model = LanguageModelRegistry::global(cx).update(cx, |registry, _cx| {
+                registry.default_model().map(|model| model.model)
+            });
+        }
+
         let (prompt_capabilities_tx, prompt_capabilities_rx) =
             watch::channel(Self::prompt_capabilities(model.as_deref()));
 
@@ -847,6 +857,7 @@ impl Thread {
             updated_at: db_thread.updated_at,
             prompt_capabilities_tx,
             prompt_capabilities_rx,
+            file_read_times: HashMap::default(),
         }
     }
 
@@ -880,98 +891,14 @@ impl Thread {
         project: Entity<Project>,
         cx: &mut Context<Self>,
     ) -> Task<Arc<ProjectSnapshot>> {
-        let git_store = project.read(cx).git_store().clone();
-        let worktree_snapshots: Vec<_> = project
-            .read(cx)
-            .visible_worktrees(cx)
-            .map(|worktree| Self::worktree_snapshot(worktree, git_store.clone(), cx))
-            .collect();
-
+        let task = project::telemetry_snapshot::TelemetrySnapshot::new(&project, cx);
         cx.spawn(async move |_, _| {
-            let worktree_snapshots = futures::future::join_all(worktree_snapshots).await;
+            let snapshot = task.await;
 
             Arc::new(ProjectSnapshot {
-                worktree_snapshots,
+                worktree_snapshots: snapshot.worktree_snapshots,
                 timestamp: Utc::now(),
             })
-        })
-    }
-
-    fn worktree_snapshot(
-        worktree: Entity<project::Worktree>,
-        git_store: Entity<GitStore>,
-        cx: &App,
-    ) -> Task<WorktreeSnapshot> {
-        cx.spawn(async move |cx| {
-            // Get worktree path and snapshot
-            let worktree_info = cx.update(|app_cx| {
-                let worktree = worktree.read(app_cx);
-                let path = worktree.abs_path().to_string_lossy().into_owned();
-                let snapshot = worktree.snapshot();
-                (path, snapshot)
-            });
-
-            let Ok((worktree_path, _snapshot)) = worktree_info else {
-                return WorktreeSnapshot {
-                    worktree_path: String::new(),
-                    git_state: None,
-                };
-            };
-
-            let git_state = git_store
-                .update(cx, |git_store, cx| {
-                    git_store
-                        .repositories()
-                        .values()
-                        .find(|repo| {
-                            repo.read(cx)
-                                .abs_path_to_repo_path(&worktree.read(cx).abs_path())
-                                .is_some()
-                        })
-                        .cloned()
-                })
-                .ok()
-                .flatten()
-                .map(|repo| {
-                    repo.update(cx, |repo, _| {
-                        let current_branch =
-                            repo.branch.as_ref().map(|branch| branch.name().to_owned());
-                        repo.send_job(None, |state, _| async move {
-                            let RepositoryState::Local { backend, .. } = state else {
-                                return GitState {
-                                    remote_url: None,
-                                    head_sha: None,
-                                    current_branch,
-                                    diff: None,
-                                };
-                            };
-
-                            let remote_url = backend.remote_url("origin");
-                            let head_sha = backend.head_sha().await;
-                            let diff = backend.diff(DiffType::HeadToWorktree).await.ok();
-
-                            GitState {
-                                remote_url,
-                                head_sha,
-                                current_branch,
-                                diff,
-                            }
-                        })
-                    })
-                });
-
-            let git_state = match git_state {
-                Some(git_state) => match git_state.ok() {
-                    Some(git_state) => git_state.await.ok(),
-                    None => None,
-                },
-                None => None,
-            };
-
-            WorktreeSnapshot {
-                worktree_path,
-                git_state,
-            }
         })
     }
 
@@ -1070,6 +997,7 @@ impl Thread {
         self.add_tool(NowTool);
         self.add_tool(OpenTool::new(self.project.clone()));
         self.add_tool(ReadFileTool::new(
+            cx.weak_entity(),
             self.project.clone(),
             self.action_log.clone(),
         ));
@@ -1090,8 +1018,17 @@ impl Thread {
         &self.profile_id
     }
 
-    pub fn set_profile(&mut self, profile_id: AgentProfileId) {
+    pub fn set_profile(&mut self, profile_id: AgentProfileId, cx: &mut Context<Self>) {
+        if self.profile_id == profile_id {
+            return;
+        }
+
         self.profile_id = profile_id;
+
+        // Swap to the profile's preferred model when available.
+        if let Some(model) = Self::resolve_profile_model(&self.profile_id, cx) {
+            self.set_model(model, cx);
+        }
     }
 
     pub fn cancel(&mut self, cx: &mut Context<Self>) {
@@ -1133,14 +1070,47 @@ impl Thread {
         Ok(())
     }
 
-    pub fn latest_token_usage(&self) -> Option<acp_thread::TokenUsage> {
+    pub fn latest_request_token_usage(&self) -> Option<language_model::TokenUsage> {
         let last_user_message = self.last_user_message()?;
         let tokens = self.request_token_usage.get(&last_user_message.id)?;
-        let model = self.model.clone()?;
+        Some(*tokens)
+    }
 
+    pub fn latest_token_usage(&self) -> Option<acp_thread::TokenUsage> {
+        let usage = self.latest_request_token_usage()?;
+        let model = self.model.clone()?;
         Some(acp_thread::TokenUsage {
             max_tokens: model.max_token_count_for_mode(self.completion_mode.into()),
-            used_tokens: tokens.total_tokens(),
+            used_tokens: usage.total_tokens(),
+        })
+    }
+
+    /// Look up the active profile and resolve its preferred model if one is configured.
+    fn resolve_profile_model(
+        profile_id: &AgentProfileId,
+        cx: &mut Context<Self>,
+    ) -> Option<Arc<dyn LanguageModel>> {
+        let selection = AgentSettings::get_global(cx)
+            .profiles
+            .get(profile_id)?
+            .default_model
+            .clone()?;
+        Self::resolve_model_from_selection(&selection, cx)
+    }
+
+    /// Translate a stored model selection into the configured model from the registry.
+    fn resolve_model_from_selection(
+        selection: &LanguageModelSelection,
+        cx: &mut Context<Self>,
+    ) -> Option<Arc<dyn LanguageModel>> {
+        let selected = SelectedModel {
+            provider: LanguageModelProviderId::from(selection.provider.0.clone()),
+            model: LanguageModelId::from(selection.model.clone()),
+        };
+        LanguageModelRegistry::global(cx).update(cx, |registry, cx| {
+            registry
+                .select_model(&selected, cx)
+                .map(|configured| configured.model)
         })
     }
 
@@ -1180,6 +1150,14 @@ impl Thread {
         cx.notify();
 
         log::debug!("Total messages in thread: {}", self.messages.len());
+        self.run_turn(cx)
+    }
+
+    #[cfg(feature = "eval")]
+    pub fn proceed(
+        &mut self,
+        cx: &mut Context<Self>,
+    ) -> Result<mpsc::UnboundedReceiver<Result<ThreadEvent>>> {
         self.run_turn(cx)
     }
 
@@ -1285,15 +1263,13 @@ impl Thread {
 
                 event_stream.update_tool_call_fields(
                     &tool_result.tool_use_id,
-                    acp::ToolCallUpdateFields {
-                        status: Some(if tool_result.is_error {
+                    acp::ToolCallUpdateFields::new()
+                        .status(if tool_result.is_error {
                             acp::ToolCallStatus::Failed
                         } else {
                             acp::ToolCallStatus::Completed
-                        }),
-                        raw_output: tool_result.output.clone(),
-                        ..Default::default()
-                    },
+                        })
+                        .raw_output(tool_result.output.clone()),
                 );
                 this.update(cx, |this, _cx| {
                     this.pending_message()
@@ -1414,6 +1390,18 @@ impl Thread {
                 self.handle_thinking_event(text, signature, event_stream, cx)
             }
             RedactedThinking { data } => self.handle_redacted_thinking_event(data, cx),
+            ReasoningDetails(details) => {
+                let last_message = self.pending_message();
+                // Store the last non-empty reasoning_details (overwrites earlier ones)
+                // This ensures we keep the encrypted reasoning with signatures, not the early text reasoning
+                if let serde_json::Value::Array(ref arr) = details {
+                    if !arr.is_empty() {
+                        last_message.reasoning_details = Some(details);
+                    }
+                } else {
+                    last_message.reasoning_details = Some(details);
+                }
+            }
             ToolUse(tool_use) => {
                 return Ok(self.handle_tool_use_event(tool_use, event_stream, cx));
             }
@@ -1446,20 +1434,16 @@ impl Thread {
                 );
                 self.update_token_usage(usage, cx);
             }
-            StatusUpdate(CompletionRequestStatus::UsageUpdated { amount, limit }) => {
+            UsageUpdated { amount, limit } => {
                 self.update_model_request_usage(amount, limit, cx);
             }
-            StatusUpdate(
-                CompletionRequestStatus::Started
-                | CompletionRequestStatus::Queued { .. }
-                | CompletionRequestStatus::Failed { .. },
-            ) => {}
-            StatusUpdate(CompletionRequestStatus::ToolUseLimitReached) => {
+            ToolUseLimitReached => {
                 self.tool_use_limit_reached = true;
             }
             Stop(StopReason::Refusal) => return Err(CompletionError::Refusal.into()),
             Stop(StopReason::MaxTokens) => return Err(CompletionError::MaxTokens.into()),
             Stop(StopReason::ToolUse | StopReason::EndTurn) => {}
+            Started | Queued { .. } => {}
         }
 
         Ok(None)
@@ -1550,19 +1534,23 @@ impl Thread {
         });
 
         if push_new_tool_use {
-            event_stream.send_tool_call(&tool_use.id, title, kind, tool_use.input.clone());
+            event_stream.send_tool_call(
+                &tool_use.id,
+                &tool_use.name,
+                title,
+                kind,
+                tool_use.input.clone(),
+            );
             last_message
                 .content
                 .push(AgentMessageContent::ToolUse(tool_use.clone()));
         } else {
             event_stream.update_tool_call_fields(
                 &tool_use.id,
-                acp::ToolCallUpdateFields {
-                    title: Some(title.into()),
-                    kind: Some(kind),
-                    raw_input: Some(tool_use.input.clone()),
-                    ..Default::default()
-                },
+                acp::ToolCallUpdateFields::new()
+                    .title(title.as_str())
+                    .kind(kind)
+                    .raw_input(tool_use.input.clone()),
             );
         }
 
@@ -1584,10 +1572,9 @@ impl Thread {
         let fs = self.project.read(cx).fs().clone();
         let tool_event_stream =
             ToolCallEventStream::new(tool_use.id.clone(), event_stream.clone(), Some(fs));
-        tool_event_stream.update_fields(acp::ToolCallUpdateFields {
-            status: Some(acp::ToolCallStatus::InProgress),
-            ..Default::default()
-        });
+        tool_event_stream.update_fields(
+            acp::ToolCallUpdateFields::new().status(acp::ToolCallStatus::InProgress),
+        );
         let supports_images = self.model().is_some_and(|model| model.supports_images());
         let tool_result = tool.run(tool_use.input, tool_event_stream, cx);
         log::debug!("Running tool {}", tool_use.name);
@@ -1687,6 +1674,7 @@ impl Thread {
             role: Role::User,
             content: vec![SUMMARIZE_THREAD_DETAILED_PROMPT.into()],
             cache: false,
+            reasoning_details: None,
         });
 
         let task = cx
@@ -1697,9 +1685,7 @@ impl Thread {
                     let event = event.log_err()?;
                     let text = match event {
                         LanguageModelCompletionEvent::Text(text) => text,
-                        LanguageModelCompletionEvent::StatusUpdate(
-                            CompletionRequestStatus::UsageUpdated { amount, limit },
-                        ) => {
+                        LanguageModelCompletionEvent::UsageUpdated { amount, limit } => {
                             this.update(cx, |thread, cx| {
                                 thread.update_model_request_usage(amount, limit, cx);
                             })
@@ -1753,6 +1739,7 @@ impl Thread {
             role: Role::User,
             content: vec![SUMMARIZE_THREAD_PROMPT.into()],
             cache: false,
+            reasoning_details: None,
         });
         self.pending_title_generation = Some(cx.spawn(async move |this, cx| {
             let mut title = String::new();
@@ -1763,9 +1750,7 @@ impl Thread {
                     let event = event?;
                     let text = match event {
                         LanguageModelCompletionEvent::Text(text) => text,
-                        LanguageModelCompletionEvent::StatusUpdate(
-                            CompletionRequestStatus::UsageUpdated { amount, limit },
-                        ) => {
+                        LanguageModelCompletionEvent::UsageUpdated { amount, limit } => {
                             this.update(cx, |thread, cx| {
                                 thread.update_model_request_usage(amount, limit, cx);
                             })?;
@@ -1881,9 +1866,15 @@ impl Thread {
         log::debug!("Completion intent: {:?}", completion_intent);
         log::debug!("Completion mode: {:?}", self.completion_mode);
 
-        let messages = self.build_request_messages(cx);
+        let available_tools: Vec<_> = self
+            .running_turn
+            .as_ref()
+            .map(|turn| turn.tools.keys().cloned().collect())
+            .unwrap_or_default();
+
+        log::debug!("Request includes {} tools", available_tools.len());
+        let messages = self.build_request_messages(available_tools, cx);
         log::debug!("Request will include {} messages", messages.len());
-        log::debug!("Request includes {} tools", tools.len());
 
         let request = LanguageModelRequest {
             thread_id: Some(self.id.to_string()),
@@ -1922,7 +1913,7 @@ impl Thread {
             .tools
             .iter()
             .filter_map(|(tool_name, tool)| {
-                if tool.supported_provider(&model.provider_id())
+                if tool.supports_provider(&model.provider_id())
                     && profile.is_tool_enabled(tool_name)
                 {
                     Some((truncate(tool_name), tool.clone()))
@@ -1974,7 +1965,11 @@ impl Thread {
         self.running_turn.as_ref()?.tools.get(name).cloned()
     }
 
-    fn build_request_messages(&self, cx: &App) -> Vec<LanguageModelRequestMessage> {
+    fn build_request_messages(
+        &self,
+        available_tools: Vec<SharedString>,
+        cx: &App,
+    ) -> Vec<LanguageModelRequestMessage> {
         log::trace!(
             "Building request messages from {} thread messages",
             self.messages.len()
@@ -1982,7 +1977,8 @@ impl Thread {
 
         let system_prompt = SystemPromptTemplate {
             project: self.project_context.read(cx),
-            available_tools: self.tools.keys().cloned().collect(),
+            available_tools,
+            model_name: self.model.as_ref().map(|m| m.name().0.to_string()),
         }
         .render(&self.templates)
         .context("failed to build system prompt")
@@ -1991,6 +1987,7 @@ impl Thread {
             role: Role::System,
             content: vec![system_prompt.into()],
             cache: false,
+            reasoning_details: None,
         }];
         for message in &self.messages {
             messages.extend(message.to_request());
@@ -2193,12 +2190,12 @@ where
 
     /// Returns the JSON schema that describes the tool's input.
     fn input_schema(format: LanguageModelToolSchemaFormat) -> Schema {
-        crate::tool_schema::root_schema_for::<Self::Input>(format)
+        language_model::tool_schema::root_schema_for::<Self::Input>(format)
     }
 
     /// Some tools rely on a provider for the underlying billing or other reasons.
     /// Allow the tool to check if they are compatible, or should be filtered out.
-    fn supported_provider(&self, _provider: &LanguageModelProviderId) -> bool {
+    fn supports_provider(_provider: &LanguageModelProviderId) -> bool {
         true
     }
 
@@ -2239,7 +2236,7 @@ pub trait AnyAgentTool {
     fn kind(&self) -> acp::ToolKind;
     fn initial_title(&self, input: serde_json::Value, _cx: &mut App) -> SharedString;
     fn input_schema(&self, format: LanguageModelToolSchemaFormat) -> Result<serde_json::Value>;
-    fn supported_provider(&self, _provider: &LanguageModelProviderId) -> bool {
+    fn supports_provider(&self, _provider: &LanguageModelProviderId) -> bool {
         true
     }
     fn run(
@@ -2280,12 +2277,12 @@ where
 
     fn input_schema(&self, format: LanguageModelToolSchemaFormat) -> Result<serde_json::Value> {
         let mut json = serde_json::to_value(T::input_schema(format))?;
-        crate::tool_schema::adapt_schema_to_format(&mut json, format)?;
+        language_model::tool_schema::adapt_schema_to_format(&mut json, format)?;
         Ok(json)
     }
 
-    fn supported_provider(&self, provider: &LanguageModelProviderId) -> bool {
-        self.0.supported_provider(provider)
+    fn supports_provider(&self, provider: &LanguageModelProviderId) -> bool {
+        T::supports_provider(provider)
     }
 
     fn run(
@@ -2345,6 +2342,7 @@ impl ThreadEventStream {
     fn send_tool_call(
         &self,
         id: &LanguageModelToolUseId,
+        tool_name: &str,
         title: SharedString,
         kind: acp::ToolKind,
         input: serde_json::Value,
@@ -2352,6 +2350,7 @@ impl ThreadEventStream {
         self.0
             .unbounded_send(Ok(ThreadEvent::ToolCall(Self::initial_tool_call(
                 id,
+                tool_name,
                 title.to_string(),
                 kind,
                 input,
@@ -2361,21 +2360,18 @@ impl ThreadEventStream {
 
     fn initial_tool_call(
         id: &LanguageModelToolUseId,
+        tool_name: &str,
         title: String,
         kind: acp::ToolKind,
         input: serde_json::Value,
     ) -> acp::ToolCall {
-        acp::ToolCall {
-            meta: None,
-            id: acp::ToolCallId(id.to_string().into()),
-            title,
-            kind,
-            status: acp::ToolCallStatus::Pending,
-            content: vec![],
-            locations: vec![],
-            raw_input: Some(input),
-            raw_output: None,
-        }
+        acp::ToolCall::new(id.to_string(), title)
+            .kind(kind)
+            .raw_input(input)
+            .meta(acp::Meta::from_iter([(
+                "tool_name".into(),
+                tool_name.into(),
+            )]))
     }
 
     fn update_tool_call_fields(
@@ -2385,12 +2381,7 @@ impl ThreadEventStream {
     ) {
         self.0
             .unbounded_send(Ok(ThreadEvent::ToolCallUpdate(
-                acp::ToolCallUpdate {
-                    meta: None,
-                    id: acp::ToolCallId(tool_use_id.to_string().into()),
-                    fields,
-                }
-                .into(),
+                acp::ToolCallUpdate::new(tool_use_id.to_string(), fields).into(),
             )))
             .ok();
     }
@@ -2453,7 +2444,7 @@ impl ToolCallEventStream {
             .0
             .unbounded_send(Ok(ThreadEvent::ToolCallUpdate(
                 acp_thread::ToolCallUpdateDiff {
-                    id: acp::ToolCallId(self.tool_use_id.to_string().into()),
+                    id: acp::ToolCallId::new(self.tool_use_id.to_string()),
                     diff,
                 }
                 .into(),
@@ -2471,33 +2462,26 @@ impl ToolCallEventStream {
             .0
             .unbounded_send(Ok(ThreadEvent::ToolCallAuthorization(
                 ToolCallAuthorization {
-                    tool_call: acp::ToolCallUpdate {
-                        meta: None,
-                        id: acp::ToolCallId(self.tool_use_id.to_string().into()),
-                        fields: acp::ToolCallUpdateFields {
-                            title: Some(title.into()),
-                            ..Default::default()
-                        },
-                    },
+                    tool_call: acp::ToolCallUpdate::new(
+                        self.tool_use_id.to_string(),
+                        acp::ToolCallUpdateFields::new().title(title.into()),
+                    ),
                     options: vec![
-                        acp::PermissionOption {
-                            id: acp::PermissionOptionId("always_allow".into()),
-                            name: "Always Allow".into(),
-                            kind: acp::PermissionOptionKind::AllowAlways,
-                            meta: None,
-                        },
-                        acp::PermissionOption {
-                            id: acp::PermissionOptionId("allow".into()),
-                            name: "Allow".into(),
-                            kind: acp::PermissionOptionKind::AllowOnce,
-                            meta: None,
-                        },
-                        acp::PermissionOption {
-                            id: acp::PermissionOptionId("deny".into()),
-                            name: "Deny".into(),
-                            kind: acp::PermissionOptionKind::RejectOnce,
-                            meta: None,
-                        },
+                        acp::PermissionOption::new(
+                            acp::PermissionOptionId::new("always_allow"),
+                            "Always Allow",
+                            acp::PermissionOptionKind::AllowAlways,
+                        ),
+                        acp::PermissionOption::new(
+                            acp::PermissionOptionId::new("allow"),
+                            "Allow",
+                            acp::PermissionOptionKind::AllowOnce,
+                        ),
+                        acp::PermissionOption::new(
+                            acp::PermissionOptionId::new("deny"),
+                            "Deny",
+                            acp::PermissionOptionKind::RejectOnce,
+                        ),
                     ],
                     response: response_tx,
                 },
@@ -2598,8 +2582,8 @@ impl From<&str> for UserMessageContent {
     }
 }
 
-impl From<acp::ContentBlock> for UserMessageContent {
-    fn from(value: acp::ContentBlock) -> Self {
+impl UserMessageContent {
+    pub fn from_content_block(value: acp::ContentBlock, path_style: PathStyle) -> Self {
         match value {
             acp::ContentBlock::Text(text_content) => Self::Text(text_content.text),
             acp::ContentBlock::Image(image_content) => Self::Image(convert_image(image_content)),
@@ -2608,7 +2592,7 @@ impl From<acp::ContentBlock> for UserMessageContent {
                 Self::Text("[audio]".to_string())
             }
             acp::ContentBlock::ResourceLink(resource_link) => {
-                match MentionUri::parse(&resource_link.uri) {
+                match MentionUri::parse(&resource_link.uri, path_style) {
                     Ok(uri) => Self::Mention {
                         uri,
                         content: String::new(),
@@ -2621,7 +2605,7 @@ impl From<acp::ContentBlock> for UserMessageContent {
             }
             acp::ContentBlock::Resource(resource) => match resource.resource {
                 acp::EmbeddedResourceResource::TextResourceContents(resource) => {
-                    match MentionUri::parse(&resource.uri) {
+                    match MentionUri::parse(&resource.uri, path_style) {
                         Ok(uri) => Self::Mention {
                             uri,
                             content: resource.text,
@@ -2642,7 +2626,15 @@ impl From<acp::ContentBlock> for UserMessageContent {
                     // TODO
                     Self::Text("[blob]".to_string())
                 }
+                other => {
+                    log::warn!("Unexpected content type: {:?}", other);
+                    Self::Text("[unknown]".to_string())
+                }
             },
+            other => {
+                log::warn!("Unexpected content type: {:?}", other);
+                Self::Text("[unknown]".to_string())
+            }
         }
     }
 }
@@ -2650,32 +2642,15 @@ impl From<acp::ContentBlock> for UserMessageContent {
 impl From<UserMessageContent> for acp::ContentBlock {
     fn from(content: UserMessageContent) -> Self {
         match content {
-            UserMessageContent::Text(text) => acp::ContentBlock::Text(acp::TextContent {
-                text,
-                annotations: None,
-                meta: None,
-            }),
-            UserMessageContent::Image(image) => acp::ContentBlock::Image(acp::ImageContent {
-                data: image.source.to_string(),
-                mime_type: "image/png".to_string(),
-                meta: None,
-                annotations: None,
-                uri: None,
-            }),
-            UserMessageContent::Mention { uri, content } => {
-                acp::ContentBlock::Resource(acp::EmbeddedResource {
-                    meta: None,
-                    resource: acp::EmbeddedResourceResource::TextResourceContents(
-                        acp::TextResourceContents {
-                            meta: None,
-                            mime_type: None,
-                            text: content,
-                            uri: uri.to_uri().to_string(),
-                        },
-                    ),
-                    annotations: None,
-                })
+            UserMessageContent::Text(text) => text.into(),
+            UserMessageContent::Image(image) => {
+                acp::ContentBlock::Image(acp::ImageContent::new(image.source, "image/png"))
             }
+            UserMessageContent::Mention { uri, content } => acp::ContentBlock::Resource(
+                acp::EmbeddedResource::new(acp::EmbeddedResourceResource::TextResourceContents(
+                    acp::TextResourceContents::new(content, uri.to_uri().to_string()),
+                )),
+            ),
         }
     }
 }

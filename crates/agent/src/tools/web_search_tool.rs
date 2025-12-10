@@ -57,7 +57,7 @@ impl AgentTool for WebSearchTool {
     }
 
     /// We currently only support Zed Cloud as a provider.
-    fn supported_provider(&self, provider: &LanguageModelProviderId) -> bool {
+    fn supports_provider(provider: &LanguageModelProviderId) -> bool {
         provider == &ZED_CLOUD_PROVIDER_ID
     }
 
@@ -76,10 +76,8 @@ impl AgentTool for WebSearchTool {
             let response = match search_task.await {
                 Ok(response) => response,
                 Err(err) => {
-                    event_stream.update_fields(acp::ToolCallUpdateFields {
-                        title: Some("Web Search Failed".to_string()),
-                        ..Default::default()
-                    });
+                    event_stream
+                        .update_fields(acp::ToolCallUpdateFields::new().title("Web Search Failed"));
                     return Err(err);
                 }
             };
@@ -107,26 +105,23 @@ fn emit_update(response: &WebSearchResponse, event_stream: &ToolCallEventStream)
     } else {
         format!("{} results", response.results.len())
     };
-    event_stream.update_fields(acp::ToolCallUpdateFields {
-        title: Some(format!("Searched the web: {result_text}")),
-        content: Some(
-            response
-                .results
-                .iter()
-                .map(|result| acp::ToolCallContent::Content {
-                    content: acp::ContentBlock::ResourceLink(acp::ResourceLink {
-                        name: result.title.clone(),
-                        uri: result.url.clone(),
-                        title: Some(result.title.clone()),
-                        description: Some(result.text.clone()),
-                        mime_type: None,
-                        annotations: None,
-                        size: None,
-                        meta: None,
-                    }),
-                })
-                .collect(),
-        ),
-        ..Default::default()
-    });
+    event_stream.update_fields(
+        acp::ToolCallUpdateFields::new()
+            .title(format!("Searched the web: {result_text}"))
+            .content(
+                response
+                    .results
+                    .iter()
+                    .map(|result| {
+                        acp::ToolCallContent::Content(acp::Content::new(
+                            acp::ContentBlock::ResourceLink(
+                                acp::ResourceLink::new(result.title.clone(), result.url.clone())
+                                    .title(result.title.clone())
+                                    .description(result.text.clone()),
+                            ),
+                        ))
+                    })
+                    .collect::<Vec<_>>(),
+            ),
+    );
 }

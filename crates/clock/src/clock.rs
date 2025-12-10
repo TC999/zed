@@ -83,7 +83,7 @@ impl Global {
         self.values.get(replica_id.0 as usize).copied().unwrap_or(0) as Seq
     }
 
-    /// Observe the lamport timestampe.
+    /// Observe the lamport timestamp.
     ///
     /// This sets the current sequence number of the observed replica ID to the maximum of this global's observed sequence and the observed timestamp.
     pub fn observe(&mut self, timestamp: Lamport) {
@@ -260,7 +260,7 @@ impl fmt::Debug for Lamport {
 impl fmt::Debug for Global {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "Global {{")?;
-        for timestamp in self.iter() {
+        for timestamp in self.iter().filter(|t| t.value > 0) {
             if timestamp.replica_id.0 > 0 {
                 write!(f, ", ")?;
             }
